@@ -1,0 +1,21 @@
+{
+  "name": "feishu-dispatch",
+  "version": "2.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "description": "飞书多维表格客资派单",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wzz19931003/feishu-dispatch.git"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test production-v2/engine.test.mjs production-v2/field-map.test.mjs production-v2/migration.test.mjs production-v2/runtime.test.mjs production-v2/sales-mirror.test.mjs production-v2/setup-tools.test.mjs production-v2/staff-integration.test.mjs production-v2/staff-provisioner.test.mjs production-v2/staff-roster.test.mjs production-v2/staff-runtime.test.mjs production-v2/staff-setup.test.mjs production-v2/transport.test.mjs desktop-installer/deploy.test.mjs desktop-installer/feed.test.mjs production-v2/public-staff-config.test.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0"
+  }
+}

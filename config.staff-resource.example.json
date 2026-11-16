@@ -1,0 +1,90 @@
+{
+  "format": "shiyeji-staff-resource-v1",
+  "appId": "",
+  "source": {
+    "appToken": "",
+    "tableId": ""
+  },
+  "staffManagement": {
+    "enabled": false,
+    "appToken": "",
+    "tableId": "",
+    "fields": {
+      "employee": {
+        "fieldId": "",
+        "types": [
+          11
+        ],
+        "multiple": false
+      },
+      "role": {
+        "fieldId": "",
+        "types": [
+          3
+        ]
+      },
+      "enabled": {
+        "fieldId": "",
+        "types": [
+          7
+        ]
+      },
+      "order": {
+        "fieldId": "",
+        "types": [
+          2
+        ]
+      },
+      "notes": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "status": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "personalUrl": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "updatedAt": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "error": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      }
+    },
+    "fixedReaders": [
+      {
+        "openId": "",
+        "displayName": "示例查看人1"
+      },
+      {
+        "openId": "",
+        "displayName": "示例查看人2"
+      },
+      {
+        "openId": "",
+        "displayName": "示例查看人3"
+      },
+      {
+        "openId": "",
+        "displayName": "示例查看人4"
+      }
+    ],
+    "operatorFormUrl": "",
+    "seedRecordIds": []
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "_说明": "示例配置。请在部署电脑使用私有配置保存凭据及实际资源标识。",
+  "appId": "",
+  "appSecret": "",
+  "appToken": "",
+  "baseUrl": "",
+  "tableIds": {
+    "leads": ""
+  },
+  "fields": {
+    "leads": {
+      "owner": {
+        "fieldId": "",
+        "types": [
+          11
+        ],
+        "multiple": false
+      },
+      "operator": {
+        "fieldId": "",
+        "types": [
+          11
+        ],
+        "multiple": false
+      },
+      "wx": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "needs": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      },
+      "wxStatus": {
+        "fieldId": "",
+        "types": [
+          3
+        ]
+      },
+      "addMethod": {
+        "fieldId": "",
+        "types": [
+          3
+        ]
+      },
+      "partySize": {
+        "fieldId": "",
+        "types": [
+          1,
+          2
+        ]
+      },
+      "actualSlot": {
+        "fieldId": "",
+        "types": [
+          2
+        ]
+      },
+      "actualSort": {
+        "fieldId": "",
+        "types": [
+          2
+        ]
+      },
+      "salesName": {
+        "fieldId": "",
+        "types": [
+          1
+        ]
+      }
+    }
+  },
+  "members": [
+    {
+      "id": "sales_slot_1",
+      "displayName": "示例销售1",
+      "openId": "",
+      "order": 1,
+      "enabled": false,
+      "target": null
+    },
+    {
+      "id": "sales_slot_2",
+      "displayName": "示例销售2",
+      "openId": "",
+      "order": 2,
+      "enabled": false,
+      "target": null
+    }
+  ],
+  "requiredLeadFields": [
+    "wx",
+    "needs"
+  ],
+  "enabled": false,
+  "notification": {
+    "enabled": false,
+    "title": "新客资待跟进"
+  },
+  "allowedHost": "",
+  "pollSeconds": 600,
+  "events": true,
+  "dbPath": "data/workflow.sqlite",
+  "mirrors": {
+    "enabled": true,
+    "feedbackFields": [
+      "wxStatus"
+    ]
+  },
+  "staffManagement": {
+    "enabled": false
+  }
+}

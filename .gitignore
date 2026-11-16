@@ -1,0 +1,17 @@
+node_modules/
+data/
+logs/
+backups/
+outputs/
+releases/
+.desktop-update/
+*.local.json
+*.private.*
+.env
+.env.*
+*.sqlite*
+*.db
+*.pem
+*.key
+*.zip
+*.exe

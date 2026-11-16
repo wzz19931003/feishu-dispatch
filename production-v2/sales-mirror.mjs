@@ -1,0 +1,329 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { resolveFields, recordView, encodePatch } from './field-map.mjs';
+
+export class SalesMirrorError extends Error {
+  constructor(code) { super(`销售镜像处理未完成（${code}）`); this.name = 'SalesMirrorError'; this.code = code; }
+}
+const fail = code => { throw new SalesMirrorError(code); };
+const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+const fingerprint = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+const safeCode = error => /^[A-Z0-9_]{1,80}$/.test(String(error?.code || '')) ? String(error.code) : 'MIRROR_REMOTE_ERROR';
+const absent = error => ['1254043', 'RECORD_NOT_FOUND', 'SOURCE_RECORD_NOT_FOUND', 'SOURCE_NOT_FOUND'].includes(String(error?.code || ''));
+const COPY_FIELDS = Object.freeze(['wx', 'needs', 'wxStatus', 'addMethod', 'partySize', 'salesName']);
+const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'addMethod', 'partySize']);
+const equal = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
+const targetIdentity = target => JSON.stringify([target.appToken, target.tableId]);
+const stopped = shouldStop => { try { return Boolean(shouldStop?.()); } catch { return true; } };
+const iso = () => new Date().toISOString();
+
+async function records(client, target) {
+  const result = [], cursors = new Set(), ids = new Set(); let cursor;
+  do {
+    const page = typeof client.listRecords === 'function'
+      ? await client.listRecords(target.tableId, { pageSize: 100, ...(cursor ? { pageToken: cursor } : {}) })
+      : await client.api(`/open-apis/bitable/v1/apps/${encodeURIComponent(target.appToken)}/tables/${encodeURIComponent(target.tableId)}/records`, { method: 'GET', query: { page_size: 100, ...(cursor ? { page_token: cursor } : {}) } });
+    if (!Array.isArray(page?.items)) fail('MIRROR_RECORDS_INVALID');
+    for (const item of page.items) {
+      const id = item?.record_id || item?.recordId || item?.id;
+      if (typeof id !== 'string' || !id || ids.has(id)) fail('MIRROR_RECORD_ID_INVALID');
+      ids.add(id); result.push(item);
+    }
+    if (!(page.hasMore ?? page.has_more)) break;
+    const next = page.pageToken ?? page.page_token;
+    if (typeof next !== 'string' || !next || cursors.has(next) || cursors.size > 1000) fail('MIRROR_PAGINATION_INVALID');
+    cursors.add(next); cursor = next;
+  } while (true);
+  return result;
+}
+
+/** Uses only its own two tables in the caller-owned SQLite connection. */
+export class SalesMirror {
+  constructor({ config, db, sourceClient, clientFactory, readSource, resolveSource, now = Date.now } = {}) {
+    if (!config || !db?.prepare || !sourceClient || typeof clientFactory !== 'function' || typeof readSource !== 'function' || typeof resolveSource !== 'function') fail('MIRROR_ARGUMENTS_REQUIRED');
+    this.config = config; this.db = db; this.sourceClient = sourceClient; this.clientFactory = clientFactory; this.readSource = readSource; this.resolveSource = resolveSource; this.busy = false;
+    this.now = now; this.sourceMutationCount = 0;
+    const feedback = config.mirrors?.feedbackFields || ['wxStatus'];
+    if (!Array.isArray(feedback) || !feedback.includes('wxStatus') || feedback.some(key => !FEEDBACK_FIELDS.has(key)) || new Set(feedback).size !== feedback.length) fail('MIRROR_FEEDBACK_INVALID');
+    this.feedback = [...feedback];
+    db.exec('CREATE TABLE IF NOT EXISTS v2_mirrors (id TEXT PRIMARY KEY,source_id TEXT NOT NULL,version INTEGER NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL); CREATE INDEX IF NOT EXISTS v2_mirrors_source ON v2_mirrors(source_id,version); CREATE TABLE IF NOT EXISTS v2_mirror_reviews (id TEXT PRIMARY KEY,data TEXT NOT NULL);');
+    for (const row of this.rows()) if (row.sourceAppToken !== config.appToken || row.sourceTableId !== config.tableIds.leads) fail('MIRROR_DATABASE_BINDING_MISMATCH');
+    // An interrupted create can already have succeeded remotely. Do not POST again.
+    for (const row of this.rows()) if (row.state === 'creating') {
+      this.put({ ...row, state: 'create_review', errorCode: 'MIRROR_CREATE_OUTCOME_UNKNOWN' });
+      this.review('MIRROR_CREATE_OUTCOME_UNKNOWN', row.sourceId, row.id);
+    }
+  }
+  rows() { return this.db.prepare('SELECT data FROM v2_mirrors ORDER BY source_id,version').all().map(row => JSON.parse(row.data)); }
+  put(row) {
+    const value = { ...row, updatedAt: iso() };
+    this.db.prepare('INSERT INTO v2_mirrors(id,source_id,version,state,data) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source_id=excluded.source_id,version=excluded.version,state=excluded.state,data=excluded.data').run(value.id, value.sourceId, value.version, value.state, JSON.stringify(value));
+    return value;
+  }
+  latest(sourceId) { return this.rows().filter(row => row.sourceId === sourceId && row.state !== 'revoked').at(-1) || null; }
+  review(code, sourceId = '', mirrorId = '', detail = {}) {
+    const id = fingerprint([code, sourceId, mirrorId, detail.targetRecordId || '', detail.targetAppToken || '']);
+    this.db.prepare('INSERT INTO v2_mirror_reviews(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(id, JSON.stringify({ id, code, sourceId, mirrorId, ...detail, state: 'open', at: iso() }));
+  }
+  closeReviews(mirrorId) {
+    for (const record of this.db.prepare('SELECT id,data FROM v2_mirror_reviews').all()) {
+      const value = JSON.parse(record.data);
+      if (value.mirrorId === mirrorId && value.state === 'open') this.db.prepare('UPDATE v2_mirror_reviews SET data=? WHERE id=?').run(JSON.stringify({ ...value, state: 'closed', closedAt: iso() }), record.id);
+    }
+  }
+  status() {
+    const counts = {};
+    for (const row of this.rows()) counts[row.state] = (counts[row.state] || 0) + 1;
+    const reviews = this.db.prepare('SELECT data FROM v2_mirror_reviews').all().map(row => JSON.parse(row.data));
+    const retryTimes = this.rows().filter(row => row.state === 'active' && row.pendingFeedback && !row.feedbackBlocked && Number.isSafeInteger(row.feedbackNextAttemptAt) && row.feedbackNextAttemptAt > 0).map(row => row.feedbackNextAttemptAt);
+    return { counts, reviewsOpen: reviews.filter(row => row.state === 'open').length, nextRetryAt: retryTimes.length ? Math.min(...retryTimes) : null, busy: this.busy };
+  }
+  async exclusive(callback) { if (this.busy) fail('MIRROR_BUSY'); this.busy = true; try { return await callback(); } finally { this.busy = false; } }
+  checkWrite(shouldStop) { if (this.config.enabled !== true || this.config.mirrors?.enabled !== true) fail('MIRROR_WRITES_DISABLED'); if (stopped(shouldStop)) fail('MIRROR_STOP_REQUESTED'); }
+  async source(id) {
+    const schemaBefore = await this.resolveSource();
+    let view;
+    try { view = await this.readSource(id); } catch (error) { if (absent(error)) return null; throw error; }
+    if (view == null) return null;
+    if (fingerprint(schemaBefore) !== fingerprint(await this.resolveSource())) fail('MIRROR_SOURCE_SCHEMA_CHANGED_DURING_READ');
+    if (view.id !== id || typeof view.owner !== 'string') fail('MIRROR_SOURCE_INVALID');
+    return view;
+  }
+  member(owner) {
+    const matches = (this.config.members || []).filter(member => member.openId === owner);
+    if (matches.length !== 1 || !matches[0].target) fail('MIRROR_TARGET_REQUIRED');
+    const member = matches[0];
+    if (member.target.appToken === this.config.appToken) fail('MIRROR_TARGET_IS_SOURCE');
+    return member;
+  }
+  values(view, resolved, member) {
+    const result = {};
+    for (const key of COPY_FIELDS) if (resolved[key] && (key === 'salesName' || this.config.fields?.leads?.[key])) result[key] = key === 'salesName' ? member.displayName : view[key] ?? (resolved[key].type === 2 ? null : '');
+    return result;
+  }
+  url(row) { const url = new URL(row.target.baseUrl); url.searchParams.set('table', row.target.tableId); url.searchParams.set('record', row.targetRecordId); return url.href; }
+  async targetRecord(row) {
+    try { const record = await this.clientFactory(row.target.appToken).readRecord(row.target.tableId, row.targetRecordId); if ((record?.record_id || record?.recordId || record?.id) !== row.targetRecordId) fail('MIRROR_TARGET_RESPONSE_MISMATCH'); return record; }
+    catch (error) { if (absent(error)) return null; throw error; }
+  }
+  async revoke(row, { shouldStop = () => false, tombstone = false, replacedTarget = false } = {}) {
+    if (!row.targetRecordId) {
+      this.review('MIRROR_REVOKE_CREATE_UNKNOWN', row.sourceId, row.id);
+      fail('MIRROR_REVOKE_REVIEW_REQUIRED');
+    }
+    const fresh = await this.source(row.sourceId);
+    // Ownership can return to the old salesperson before deletion starts.
+    if (!tombstone && !replacedTarget && fresh?.owner === row.owner) { if (row.state !== 'active') this.put({ ...row, state: 'active', errorCode: '' }); return false; }
+    const client = this.clientFactory(row.target.appToken);
+    const existing = await this.targetRecord(row);
+    if (!existing) { if (row.state === 'revoked') return false; this.put({ ...row, state: 'revoked', revokedAt: iso(), errorCode: '' }); this.closeReviews(row.id); return true; }
+    this.put({ ...row, state: 'revoke_pending', errorCode: '' });
+    const finalSource = await this.source(row.sourceId);
+    if (!tombstone && !replacedTarget && finalSource?.owner === row.owner) { this.put({ ...row, state: 'active', errorCode: '' }); return false; }
+    this.checkWrite(shouldStop);
+    try {
+      if (typeof client.deleteRecord === 'function') await client.deleteRecord(row.target.tableId, row.targetRecordId);
+      else await client.api(`/open-apis/bitable/v1/apps/${encodeURIComponent(row.target.appToken)}/tables/${encodeURIComponent(row.target.tableId)}/records/${encodeURIComponent(row.targetRecordId)}`, { method: 'DELETE' });
+    } catch (error) { if (!absent(error)) { const after = await this.targetRecord(row); if (after) { this.review('MIRROR_REVOKE_UNCONFIRMED', row.sourceId, row.id); throw error; } } }
+    if (await this.targetRecord(row)) { this.review('MIRROR_REVOKE_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_REVOKE_UNCONFIRMED'); }
+    this.put({ ...row, state: 'revoked', revokedAt: iso(), errorCode: '' }); this.closeReviews(row.id); return true;
+  }
+  async create(source, member, shouldStop) {
+    const target = member.target, client = this.clientFactory(target.appToken);
+    const resolved = await resolveFields(client, target);
+    for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
+    const latest = await this.source(source.id);
+    if (!latest || latest.owner !== member.openId) fail('MIRROR_OWNERSHIP_CHANGED');
+    const previousVersions = this.rows().filter(row => row.sourceId === source.id).map(row => row.version);
+    const version = previousVersions.length ? Math.max(...previousVersions) + 1 : 1;
+    const atCreate = await resolveFields(client, target);
+    if (fingerprint(atCreate) !== fingerprint(resolved)) fail('MIRROR_TARGET_SCHEMA_CHANGED_BEFORE_WRITE');
+    const values = this.values(latest, atCreate, member), fields = encodePatch(values, atCreate);
+    let row = { id: fingerprint([this.config.appToken, this.config.tableIds.leads, source.id, version]), sourceAppToken: this.config.appToken, sourceTableId: this.config.tableIds.leads, sourceId: source.id, version, owner: member.openId, memberId: member.id,
+      target: structuredClone(target), targetRecordId: null, state: 'creating', clientToken: randomUUID(), baseValues: values, createdAt: iso(), errorCode: '' };
+    this.checkWrite(shouldStop);
+    this.put(row);
+    let record;
+    try {
+      if (typeof client.createRecord !== 'function') fail('MIRROR_CREATE_ADAPTER_REQUIRED');
+      record = await client.createRecord(target.tableId, fields, { clientToken: row.clientToken });
+      const id = record?.record_id || record?.recordId || record?.id;
+      if (typeof id !== 'string' || !id) fail('MIRROR_CREATE_RESULT_UNKNOWN');
+      if (this.rows().some(existing => existing.id !== row.id && targetIdentity(existing.target) === targetIdentity(target) && existing.targetRecordId === id)) fail('MIRROR_TARGET_ID_ALREADY_BOUND');
+      row = this.put({ ...row, targetRecordId: id, state: 'active' });
+    } catch (error) {
+      this.put({ ...row, state: 'create_review', errorCode: 'MIRROR_CREATE_OUTCOME_UNKNOWN' });
+      this.review('MIRROR_CREATE_OUTCOME_UNKNOWN', row.sourceId, row.id);
+      fail('MIRROR_CREATE_REVIEW_REQUIRED');
+    }
+    const after = await this.source(row.sourceId);
+    if (!after || after.owner !== row.owner) { await this.revoke(row, { shouldStop }); fail('MIRROR_OWNERSHIP_CHANGED'); }
+    const confirmed = await this.targetRecord(row);
+    if (!confirmed) { this.put({ ...row, state: 'target_missing_review', errorCode: 'MIRROR_CREATE_UNCONFIRMED' }); this.review('MIRROR_CREATE_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_TARGET_MISSING_REVIEW_REQUIRED'); }
+    const targetView = recordView(confirmed, resolved);
+    if (Object.entries(values).some(([key, value]) => !equal(targetView[key], value))) { this.review('MIRROR_CREATE_CONTENT_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_CREATE_CONTENT_UNCONFIRMED'); }
+    return row;
+  }
+  async reconcile(row, member, shouldStop) {
+    const client = this.clientFactory(row.target.appToken), resolved = await resolveFields(client, member.target);
+    for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
+    const sourceResolved = await this.resolveSource();
+    const record = await this.targetRecord(row);
+    if (!record) { this.put({ ...row, state: 'target_missing_review', errorCode: 'MIRROR_TARGET_RECORD_MISSING' }); this.review('MIRROR_TARGET_RECORD_MISSING', row.sourceId, row.id); fail('MIRROR_TARGET_MISSING_REVIEW_REQUIRED'); }
+    const targetView = recordView(record, resolved);
+    let fresh = await this.source(row.sourceId);
+    if (!fresh || fresh.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+    const sourceValues = this.values(fresh, resolved, member), inbound = {};
+    for (const key of this.feedback) {
+      if (!Object.hasOwn(row.baseValues, key) || !resolved[key] || !sourceResolved[key]) fail('MIRROR_FEEDBACK_BASELINE_MISSING');
+      if (equal(targetView[key], row.baseValues[key]) || equal(targetView[key], sourceValues[key])) continue;
+      if (!equal(sourceValues[key], row.baseValues[key])) {
+        this.review('MIRROR_FEEDBACK_CONFLICT', row.sourceId, row.id);
+        fail('MIRROR_FEEDBACK_CONFLICT');
+      }
+      inbound[key] = targetView[key];
+    }
+    if (Object.keys(inbound).length) {
+      if (row.feedbackBlocked) fail('MIRROR_FEEDBACK_REVIEW_REQUIRED');
+      if ((row.feedbackNextAttemptAt || 0) > this.now()) fail('MIRROR_FEEDBACK_RETRY_LATER');
+      // The source update uses only immutable backend mapping, never a child source-ID column.
+      const final = await this.source(row.sourceId);
+      if (!final || final.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+      for (const key of Object.keys(inbound)) if (!equal(final[key], fresh[key])) { this.review('MIRROR_FEEDBACK_CONFLICT', row.sourceId, row.id); fail('MIRROR_FEEDBACK_CONFLICT'); }
+      const atSourceWrite = await this.resolveSource();
+      if (fingerprint(atSourceWrite) !== fingerprint(sourceResolved)) fail('MIRROR_SOURCE_SCHEMA_CHANGED_BEFORE_WRITE');
+      const patch = encodePatch(inbound, atSourceWrite);
+      this.checkWrite(shouldStop);
+      const attempts = (row.feedbackAttempts || 0) + 1;
+      row = this.put({ ...row, pendingFeedback: inbound, feedbackAttempts: attempts, feedbackNextAttemptAt: this.now() + Math.min(300_000, 2000 * 2 ** Math.min(attempts, 8)) });
+      this.sourceMutationCount++;
+      try { await this.sourceClient.updateRecord(this.config.tableIds.leads, row.sourceId, patch); }
+      catch (error) { this.put({ ...row, feedbackBlocked: attempts >= 8, errorCode: safeCode(error) }); this.review(attempts >= 8 ? 'MIRROR_FEEDBACK_REVIEW_REQUIRED' : 'MIRROR_FEEDBACK_UPDATE_FAILED', row.sourceId, row.id); throw error; }
+      fresh = await this.source(row.sourceId);
+      if (!fresh || fresh.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+      if (Object.entries(inbound).some(([key, value]) => !equal(fresh[key], value))) { this.review('MIRROR_FEEDBACK_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_FEEDBACK_UNCONFIRMED'); }
+    }
+    // Read ownership once more immediately before any write to the sales table.
+    fresh = await this.source(row.sourceId);
+    if (!fresh || fresh.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+    const canonical = this.values(fresh, resolved, member), outbound = {};
+    for (const [key, value] of Object.entries(canonical)) if (!equal(targetView[key], value)) outbound[key] = value;
+    if (Object.keys(outbound).length) {
+      const atTargetWrite = await resolveFields(client, member.target);
+      if (fingerprint(atTargetWrite) !== fingerprint(resolved)) fail('MIRROR_TARGET_SCHEMA_CHANGED_BEFORE_WRITE');
+      const patch = encodePatch(outbound, atTargetWrite);
+      this.checkWrite(shouldStop);
+      await client.updateRecord(row.target.tableId, row.targetRecordId, patch);
+    }
+    const after = await this.source(row.sourceId);
+    if (!after || after.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+    this.put({ ...row, state: 'active', baseValues: canonical, pendingFeedback: null, feedbackAttempts: 0, feedbackNextAttemptAt: 0, feedbackBlocked: false, errorCode: '' });
+    this.closeReviews(row.id);
+    return true;
+  }
+  async ensureInternal(view, { shouldStop = () => false } = {}) {
+    if (typeof view?.id !== 'string' || !view.id) fail('MIRROR_SOURCE_ID_REQUIRED');
+    this.checkWrite(shouldStop);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const fresh = await this.source(view.id), current = this.latest(view.id);
+      if (!fresh?.owner) {
+        if (current) await this.revoke(current, { shouldStop });
+        fail(fresh ? 'MIRROR_SOURCE_UNASSIGNED' : 'MIRROR_SOURCE_DELETED');
+      }
+      let member;
+      try { member = this.member(fresh.owner); }
+      catch (error) { if (current) await this.revoke(current, { shouldStop, replacedTarget: current.owner === fresh.owner }); this.review('MIRROR_TARGET_REQUIRED', view.id, current?.id || ''); throw error; }
+      if (current?.state === 'create_review' || current?.state === 'creating') fail('MIRROR_CREATE_REVIEW_REQUIRED');
+      const same = current && current.owner === fresh.owner && current.memberId === member.id && targetIdentity(current.target) === targetIdentity(member.target);
+      if (current && !same) { const revoked = await this.revoke(current, { shouldStop, replacedTarget: current.owner === fresh.owner }); if (!revoked) continue; }
+      else if (same) {
+        if (current.state === 'revoke_pending') { this.put({ ...current, state: 'active', errorCode: '' }); }
+        try { if (await this.reconcile(current, member, shouldStop)) return { url: this.url(current), targetRecordId: current.targetRecordId }; }
+        catch (error) { if (safeCode(error) === 'MIRROR_OWNERSHIP_CHANGED') continue; throw error; }
+        continue;
+      }
+      // A manually restored revoked record must not become a second active mirror.
+      for (const old of this.rows().filter(row => row.sourceId === view.id && row.state === 'revoked' && row.targetRecordId)) {
+        if (await this.targetRecord(old)) await this.revoke(old, { shouldStop, tombstone: true });
+      }
+      try { const row = await this.create(fresh, member, shouldStop); return { url: this.url(row), targetRecordId: row.targetRecordId }; }
+      catch (error) { if (safeCode(error) === 'MIRROR_OWNERSHIP_CHANGED') continue; throw error; }
+    }
+    fail('MIRROR_OWNERSHIP_UNSTABLE');
+  }
+  ensure(view, options = {}) { return this.exclusive(() => this.ensureInternal(view, options)); }
+  sync({ shouldStop = () => false, sourceViews } = {}) {
+    return this.exclusive(async () => {
+      const mutationsBefore = this.sourceMutationCount;
+      const counts = { sourceRecords: 0, unchanged: 0, ensured: 0, revoked: 0, reviews: 0, unknownChildRecords: 0, sourceWrites: 0, stopped: false };
+      this.checkWrite(shouldStop);
+      const sourceResolved = await this.resolveSource();
+      const sourceRecords = sourceViews === undefined ? await records(this.sourceClient, { appToken: this.config.appToken, tableId: this.config.tableIds.leads }) : null;
+      if (sourceViews !== undefined && !Array.isArray(sourceViews)) fail('MIRROR_SOURCE_SNAPSHOT_INVALID');
+      if (sourceViews === undefined && fingerprint(sourceResolved) !== fingerprint(await this.resolveSource())) fail('MIRROR_SOURCE_SCHEMA_CHANGED_DURING_SCAN');
+      // One metadata read and one paginated snapshot per child Base, regardless
+      // of lead count. The snapshot is a change detector, never write authority.
+      const childSnapshots = new Map();
+      for (const member of this.config.members || []) {
+        if (stopped(shouldStop)) return { ...counts, stopped: true, ...this.status(), busy: false };
+        if (!member.target) continue;
+        const client = this.clientFactory(member.target.appToken);
+        const resolved = await resolveFields(client, member.target);
+        for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
+        const childRecords = await records(client, member.target);
+        if (fingerprint(resolved) !== fingerprint(await resolveFields(client, member.target))) fail('MIRROR_TARGET_SCHEMA_CHANGED_DURING_SCAN');
+        childSnapshots.set(targetIdentity(member.target), { resolved, records: new Map(childRecords.map(record => [record.record_id || record.recordId || record.id, record])) });
+      }
+      const present = new Set();
+      const views = sourceViews || sourceRecords.map(record => {
+        const id = record.record_id || record.recordId || record.id;
+        try { return recordView(record, sourceResolved); } catch (error) { return { id, snapshotError: safeCode(error) }; }
+      });
+      for (const view of views) {
+        if (stopped(shouldStop)) { counts.stopped = true; break; }
+        const id = view?.id;
+        if (typeof id !== 'string' || !id || present.has(id)) fail('MIRROR_SOURCE_SNAPSHOT_INVALID');
+        present.add(id); counts.sourceRecords++;
+        try {
+          if (view.snapshotError) fail(view.snapshotError);
+          const current = this.latest(id);
+          if (view.owner) {
+            // A failed member lookup only disables the no-change optimization.
+            // ensureInternal must still revoke the old owner's trusted copy.
+            let member;
+            try { member = this.member(view.owner); } catch { member = null; }
+            const snapshot = member ? childSnapshots.get(targetIdentity(member.target)) : null;
+            const childRecord = current?.targetRecordId && snapshot?.records.get(current.targetRecordId);
+            if (member && current?.state === 'active' && current.owner === view.owner && current.memberId === member.id && targetIdentity(current.target) === targetIdentity(member.target) && childRecord && !current.pendingFeedback) {
+              const sourceValues = this.values(view, snapshot.resolved, member), child = recordView(childRecord, snapshot.resolved);
+              if (Object.entries(sourceValues).every(([key, value]) => equal(value, current.baseValues[key]) && equal(child[key], current.baseValues[key]))) { counts.unchanged++; continue; }
+            }
+            await this.ensureInternal(view, { shouldStop }); counts.ensured++;
+          } else if (current && await this.revoke(current, { shouldStop })) counts.revoked++;
+        } catch (error) { if (safeCode(error) === 'MIRROR_STOP_REQUESTED') { counts.stopped = true; break; } this.review(safeCode(error), id, this.latest(id)?.id || ''); counts.reviews++; }
+      }
+      if (!counts.stopped) for (const row of this.rows()) {
+        if (stopped(shouldStop)) { counts.stopped = true; break; }
+        if (present.has(row.sourceId) && row.state !== 'revoked') continue;
+        const snapshot = childSnapshots.get(targetIdentity(row.target));
+        if (row.state === 'revoked' && snapshot && !snapshot.records.has(row.targetRecordId)) continue;
+        try {
+          const source = await this.source(row.sourceId);
+          if (!source?.owner || source.owner !== row.owner || row.state === 'revoked') {
+            if (await this.revoke(row, { shouldStop, tombstone: row.state === 'revoked' })) counts.revoked++;
+          }
+        } catch (error) { if (safeCode(error) === 'MIRROR_STOP_REQUESTED') { counts.stopped = true; break; } this.review(safeCode(error), row.sourceId, row.id); counts.reviews++; }
+      }
+      // Unknown child rows are only reported. They never establish source mappings.
+      if (!counts.stopped) for (const member of this.config.members || []) {
+        if (stopped(shouldStop)) { counts.stopped = true; break; }
+        if (!member.target) continue;
+        try {
+          const childRecords = [...(childSnapshots.get(targetIdentity(member.target))?.records.values() || [])];
+          const known = new Set(this.rows().filter(row => targetIdentity(row.target) === targetIdentity(member.target) && row.targetRecordId).map(row => row.targetRecordId));
+          for (const record of childRecords) { const id = record.record_id || record.recordId || record.id; if (!known.has(id)) { counts.unknownChildRecords++; this.review('MIRROR_UNTRUSTED_CHILD_RECORD', '', '', { targetAppToken: member.target.appToken, targetRecordId: id }); } }
+        } catch (error) { this.review(safeCode(error)); counts.reviews++; }
+      }
+      return { ...counts, sourceWrites: this.sourceMutationCount - mutationsBefore, ...this.status(), busy: false };
+    });
+  }
+}

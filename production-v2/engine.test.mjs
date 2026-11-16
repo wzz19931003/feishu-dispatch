@@ -1,0 +1,303 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { WorkflowEngine } from './engine.mjs';
+import { SalesMirror } from './sales-mirror.mjs';
+
+const clone = value => structuredClone(value);
+const names = { owner: '负责人', operator: '录入运营', wx: '客户微信', needs: '客户需求', wxStatus: '微信状态', addMethod: '添加方式', actualSlot: '实际分配位', actualSort: '实际分配顺序', salesName: '实际销售' };
+const types = { owner: 11, operator: 11, wx: 1, needs: 1, wxStatus: 1, addMethod: 1, actualSlot: 2, actualSort: 2, salesName: 1 };
+const sourceFields = () => Object.fromEntries(Object.keys(names).map(key => [key, { fieldId: `fldSource${key}001`, types: [types[key]], ...(['owner', 'operator'].includes(key) ? { multiple: false } : {}) }]));
+const target = suffix => ({ appToken: `PrivateBase${suffix}12345`, baseUrl: `https://example.feishu.cn/base/PrivateBase${suffix}12345`, tableId: `tblPrivate${suffix}123`, fields: Object.fromEntries(['wx', 'needs', 'wxStatus'].map(key => [key, { fieldId: `fldTarget${suffix}${key}001`, types: [1] }])) });
+const member = (suffix, order) => ({ id: `sales_${suffix}`, openId: `ou_offlineSales${suffix}`, displayName: `模拟销售${suffix}`, order, enabled: true, target: target(suffix) });
+const configuration = () => ({ appId: 'cli_workflow_offline', appSecret: 'offline-fixture-secret', appToken: 'SourceBaseToken12345', baseUrl: 'https://example.feishu.cn/base/SourceBaseToken12345', tableIds: { leads: 'tblSourceLeads123' },
+  fields: { leads: sourceFields() }, members: [member('A', 10), member('B', 20)], requiredLeadFields: ['wx', 'needs'], enabled: true, notification: { enabled: true }, allowedHost: 'OFFLINE-TEST-ONLY', dbPath: 'data/workflow.sqlite', mirrors: { enabled: true }, pollSeconds: 600 });
+const lead = (suffix, logical = {}) => ({ record_id: `recLead${suffix}`, fields: Object.fromEntries(Object.entries({ owner: '', operator: 'ou_offlineOperatorA', wx: `offline_customer_${suffix}`, needs: '仅离线测试需求', wxStatus: '待添加', addMethod: '销售主动加', actualSlot: null, actualSort: null, salesName: '', ...logical }).map(([key, value]) => [names[key], ['owner', 'operator'].includes(key) ? value ? [{ id: value }] : [] : value])) });
+class Client {
+  constructor(records = []) {
+    this.records = new Map(records.map(record => [record.record_id, clone(record)])); this.schema = Object.entries(sourceFields()).map(([key, spec]) => ({ field_id: spec.fieldId, field_name: names[key], type: types[key], property: types[key] === 11 ? { multiple: false } : {} }));
+    this.writes = []; this.sent = []; this.operations = []; this.writeError = null; this.sendError = null;
+  }
+  async api(url) { assert.equal(url.includes('/tblSourceLeads123/fields'), true); return { items: clone(this.schema), has_more: false }; }
+  async listRecords(table) { assert.equal(table, 'tblSourceLeads123'); return { items: clone([...this.records.values()]), hasMore: false, pageToken: null }; }
+  async readRecord(table, id) { assert.equal(table, 'tblSourceLeads123'); this.operations.push(`read:${id}`); if (!this.records.has(id)) throw Object.assign(new Error('offline missing'), { code: 'SOURCE_NOT_FOUND' }); return clone(this.records.get(id)); }
+  async updateRecord(table, id, fields) { assert.equal(table, 'tblSourceLeads123'); this.operations.push(`write:${id}`); this.writes.push({ id, fields: clone(fields) }); if (this.writeError) throw this.writeError; Object.assign(this.records.get(id).fields, clone(fields)); return clone(this.records.get(id)); }
+  async sendNotification(input) { this.operations.push(`send:${input.recipientOpenId}`); this.sent.push(clone(input)); const error = typeof this.sendError === 'function' ? this.sendError(input) : this.sendError; if (error) throw error; return { messageId: `offline_message_${this.sent.length}` }; }
+  add(record) { this.records.set(record.record_id, clone(record)); }
+  change(id, logical) { const record = this.records.get(id); for (const [key, value] of Object.entries(logical)) record.fields[names[key]] = ['owner', 'operator'].includes(key) ? value ? [{ id: value }] : [] : value; }
+  rename(key, name) { const field = this.schema.find(field => field.field_id === sourceFields()[key].fieldId), before = field.field_name; field.field_name = name; for (const record of this.records.values()) { record.fields[name] = record.fields[before]; delete record.fields[before]; } }
+}
+class Mirror {
+  constructor(engine) { this.engine = engine; this.calls = []; this.syncCalls = 0; this.error = null; }
+  async ensure(view) {
+    this.calls.push(view.id); this.engine.client.operations.push(`mirror:${view.id}`); if (this.error) throw this.error;
+    const owner = this.engine.config.members.find(member => member.openId === view.owner); assert.ok(owner?.target);
+    const targetRecordId = `recPrivate${view.id}${owner.id}`, url = new URL(owner.target.baseUrl); url.searchParams.set('table', owner.target.tableId); url.searchParams.set('record', targetRecordId);
+    return { url: url.href, targetRecordId };
+  }
+  async sync({ sourceViews } = {}) { this.syncCalls++; assert.ok(Array.isArray(sourceViews)); return { synchronized: sourceViews.length }; }
+}
+async function fixture(t, { config = configuration(), client = new Client(), now, memberProvider, dbPath = ':memory:', initialize = {} } = {}) {
+  const engine = new WorkflowEngine({ config, client, dbPath, now, memberProvider }); engine.mirror = new Mirror(engine); t.after(() => engine.close());
+  assert.equal((await engine.initialize(initialize)).ok, true); return { engine, client, mirror: engine.mirror };
+}
+const numericRejection = () => Object.assign(new Error('offline definite rejection'), { code: '99991400' });
+
+test('initial source history is quiet, including non-passed statuses and customer-active-add', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA', wxStatus: '未通过', addMethod: '客户主动加' })]) });
+  await engine.scan({ apply: true }); assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0); assert.equal(engine.all('v2_outbox').length, 0);
+});
+test('new assignments use dynamic order and send only after private mirror confirmation', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('one')); client.add(lead('two'));
+  await engine.scan({ apply: true });
+  assert.deepEqual(client.sent.map(item => item.recipientOpenId).sort(), ['ou_offlineSalesA', 'ou_offlineSalesB']);
+  assert.equal(client.records.get('recLeadone').fields.实际分配位, 1); assert.equal(client.records.get('recLeadtwo').fields.实际分配顺序, 20);
+  assert.equal(client.writes.every(write => Object.keys(write.fields).every(key => ['负责人', '实际分配位', '实际分配顺序', '实际销售'].includes(key))), true);
+  assert.equal(client.operations.indexOf('mirror:recLeadone') < client.operations.indexOf('send:ou_offlineSalesA'), true);
+  assert.equal(client.sent.every(item => !item.url.includes('SourceBaseToken12345') && item.url.includes('PrivateBase')), true);
+});
+test('empty details do not consume a rotation position and become assignable when complete', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('blank', { wx: '', needs: '' })); client.add(lead('ready'));
+  await engine.scan({ apply: true }); assert.equal(engine.get('v2_snapshots', 'recLeadblank').intent, undefined); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineSalesA');
+  client.change('recLeadblank', { wx: 'offline_finished', needs: 'complete' }); await engine.scan({ apply: true });
+  assert.equal(client.records.get('recLeadblank').fields.负责人[0].id, 'ou_offlineSalesB');
+});
+test('a new third salesperson participates without changing existing owners; disabled cursor anchors remain deterministic', async t => {
+  let current = configuration(); const { engine, client } = await fixture(t, { config: current, memberProvider: () => clone(current) });
+  client.add(lead('one')); client.add(lead('two')); await engine.scan({ apply: true });
+  current.members.push(member('C', 30)); client.add(lead('three')); await engine.scan({ apply: true }); assert.equal(client.records.get('recLeadthree').fields.负责人[0].id, 'ou_offlineSalesC');
+  current.members[2].enabled = false; client.add(lead('four')); await engine.scan({ apply: true });
+  assert.equal(client.records.get('recLeadfour').fields.负责人[0].id, 'ou_offlineSalesA'); assert.equal(client.records.get('recLeadthree').fields.负责人[0].id, 'ou_offlineSalesC');
+});
+test('manual A-to-B-to-A changes notify each effective owner without writing the owner field', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { owner: 'ou_offlineSalesB' }); await engine.scan({ apply: true });
+  client.change('recLeadold', { owner: 'ou_offlineSalesA' }); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  assert.deepEqual(client.sent.map(item => item.recipientOpenId), ['ou_offlineSalesB', 'ou_offlineSalesA']);
+  assert.equal(client.writes.every(write => !Object.hasOwn(write.fields, '负责人')), true); assert.equal(engine.get('v2_snapshots', 'recLeadold').ownerVersion, 3);
+});
+test('an explicitly assigned disabled member with a valid target can still receive the manual transfer', async t => {
+  const config = configuration(); config.members[1].enabled = false;
+  const { engine, client } = await fixture(t, { config, client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { owner: 'ou_offlineSalesB' }); await engine.scan({ apply: true });
+  assert.equal(client.sent[0].recipientOpenId, 'ou_offlineSalesB'); assert.equal(client.records.get('recLeadold').fields.负责人[0].id, 'ou_offlineSalesB');
+});
+test('unknown manual owners are held until a verified member and target are configured', async t => {
+  let current = configuration(); const { engine, client } = await fixture(t, { config: current, memberProvider: () => clone(current), client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { owner: 'ou_offlineSalesC' }); await engine.scan({ apply: true }); assert.equal(client.sent.length, 0);
+  current.members.push(member('C', 30)); await engine.scan({ apply: true });
+  assert.equal(client.sent[0].recipientOpenId, 'ou_offlineSalesC'); assert.equal(client.writes.every(write => !Object.hasOwn(write.fields, '负责人')), true);
+});
+test('clearing a current owner cancels an old undelivered notice and does not automatically refill it', async t => {
+  const { engine, client, mirror } = await fixture(t); mirror.error = Object.assign(new Error('offline mirror read'), { code: 'MIRROR_TEMPORARY' });
+  client.add(lead('one')); await engine.scan({ apply: true }); assert.equal(client.sent.length, 0);
+  client.change('recLeadone', { owner: '' }); mirror.error = null; await engine.scan({ apply: true });
+  assert.equal(client.records.get('recLeadone').fields.负责人.length, 0); assert.equal(client.writes.length, 1); assert.equal(client.sent.length, 0);
+  assert.equal(engine.status().notifications.cancelled, 1);
+});
+test('source deletion cancels pending notices and removes the source from mirror snapshots', async t => {
+  const { engine, client, mirror } = await fixture(t); mirror.error = Object.assign(new Error('offline mirror read'), { code: 'MIRROR_TEMPORARY' });
+  client.add(lead('one')); await engine.scan({ apply: true }); client.records.delete('recLeadone'); mirror.error = null; await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 0); assert.equal(engine.get('v2_snapshots', 'recLeadone').deleted, true); assert.equal(engine.status().notifications.cancelled, 1);
+});
+test('status failures notify the current registered operator even without customer WeChat', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { wx: '', wxStatus: '未通过' }); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA'); assert.ok(client.sent[0].text.includes('未填写')); assert.equal(client.sent[0].url, '');
+});
+test('passed status suppresses a notification and cancels obsolete failure reminders', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.sendError = numericRejection(); client.change('recLeadold', { wxStatus: '未通过' }); await engine.scan({ apply: true });
+  client.change('recLeadold', { wxStatus: '通过' }); client.sendError = null; await engine.scan({ apply: true }); assert.equal(client.sent.length, 1);
+  client.change('recLeadold', { wxStatus: '未通过' }); await engine.scan({ apply: true }); assert.equal(client.sent.length, 2); assert.notEqual(client.sent[0].idempotencyKey, client.sent[1].idempotencyKey);
+});
+test('customer-active-add before assignment emits the final sales name and customer WeChat once', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('one', { addMethod: '客户主动加' })); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  const notices = client.sent.filter(item => item.title === '客户主动添加销售'); assert.equal(notices.length, 1); assert.equal(notices[0].recipientOpenId, 'ou_offlineOperatorA');
+  assert.ok(notices[0].text.includes('模拟销售A')); assert.ok(notices[0].text.includes('offline_customer_one')); assert.equal(notices[0].url, '');
+});
+test('assignment then active-add, followed by transfer, uses the final owner and cancels older contact tasks', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('one')); await engine.scan({ apply: true });
+  client.change('recLeadone', { addMethod: '客户主动加' }); await engine.scan({ apply: true });
+  client.change('recLeadone', { owner: 'ou_offlineSalesB' }); await engine.scan({ apply: true });
+  const notices = client.sent.filter(item => item.title === '客户主动添加销售'); assert.equal(notices.length, 2); assert.ok(notices[1].text.includes('模拟销售B'));
+  assert.equal(client.sent.filter(item => item.recipientOpenId === 'ou_offlineSalesB').length, 1);
+});
+test('turning active-add off cancels its pending contact notice; turning it on again creates a new event', async t => {
+  const { engine, client } = await fixture(t); client.sendError = input => input.title === '客户主动添加销售' ? numericRejection() : null;
+  client.add(lead('one', { addMethod: '客户主动加' })); await engine.scan({ apply: true });
+  client.change('recLeadone', { addMethod: '销售主动加' }); client.sendError = null; await engine.scan({ apply: true });
+  client.change('recLeadone', { addMethod: '客户主动加' }); await engine.scan({ apply: true });
+  const notices = client.sent.filter(item => item.title === '客户主动添加销售'); assert.equal(notices.length, 2); assert.notEqual(notices[0].idempotencyKey, notices[1].idempotencyKey);
+});
+test('operator changes reroute a still-current pending status event without sending to the former operator again', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.sendError = numericRejection(); client.change('recLeadold', { wxStatus: '未通过' }); await engine.scan({ apply: true });
+  client.sendError = null; client.change('recLeadold', { operator: 'ou_offlineOperatorB' }); await engine.scan({ apply: true });
+  assert.deepEqual(client.sent.map(item => item.recipientOpenId), ['ou_offlineOperatorA', 'ou_offlineOperatorB']);
+});
+test('independent operator notices are not blocked by a pending sales mirror', async t => {
+  const { engine, client, mirror } = await fixture(t); mirror.error = Object.assign(new Error('offline mirror'), { code: 'MIRROR_TEMPORARY' });
+  client.add(lead('one')); await engine.scan({ apply: true }); client.change('recLeadone', { wxStatus: '未通过' }); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA');
+});
+test('event IDs are persisted and deduplicated; non-source events do not enter the workflow', async t => {
+  const { engine } = await fixture(t), event = { id: 'offline_event_1', appToken: 'SourceBaseToken12345', tableId: 'tblSourceLeads123', recordIds: ['recLeadevent'] };
+  assert.equal(engine.acceptEvent(event), true); assert.equal(engine.acceptEvent(event), false); assert.equal(engine.acceptEvent({ ...event, id: 'other', tableId: 'tblFinance12345' }), false);
+  assert.equal(engine.status().eventsPending, 1); await engine.scan({ apply: true }); assert.equal(engine.status().eventsPending, 0);
+});
+test('read-only preview neither writes remote data nor creates semantic events or mirror tasks', async t => {
+  const { engine, client, mirror } = await fixture(t); client.add(lead('one', { addMethod: '客户主动加' }));
+  const before = JSON.stringify(engine.all('v2_snapshots')); const result = await engine.scan();
+  assert.equal(result.counts.assign, 1); assert.equal(JSON.stringify(engine.all('v2_snapshots')), before); assert.equal(engine.all('v2_outbox').length, 0);
+  assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0); assert.equal(mirror.syncCalls, 0);
+});
+test('field renames follow IDs, while deleted/replaced IDs or incompatible result formulas block writes', async t => {
+  const { engine, client } = await fixture(t); client.rename('owner', '改名后的负责人'); client.add(lead('one')); // Add uses the old field name but its owner is blank.
+  await engine.scan({ apply: true }); assert.equal(client.records.get('recLeadone').fields.改名后的负责人[0].id, 'ou_offlineSalesA');
+  const writes = client.writes.length; client.schema.find(field => field.field_id === sourceFields().actualSlot.fieldId).type = 20; client.add(lead('two'));
+  await assert.rejects(engine.scan({ apply: true }), { code: 'FIELD_TYPE_CHANGED' }); assert.equal(client.writes.length, writes);
+  client.schema.find(field => field.field_id === sourceFields().actualSlot.fieldId).type = 2; client.schema.find(field => field.field_id === sourceFields().owner.fieldId).field_id = 'fldDifferentOwner001';
+  await assert.rejects(engine.scan({ apply: true }), { code: 'FIELD_ID_NOT_FOUND' }); assert.equal(client.writes.length, writes);
+});
+test('initialization rejects a mid-read rename and reused old name before creating a quiet baseline', async t => {
+  const client = new Client([lead('history', { owner: 'ou_offlineSalesA' })]);
+  const engine = new WorkflowEngine({ config: configuration(), client, dbPath: ':memory:' }); engine.mirror = new Mirror(engine); t.after(() => engine.close());
+  const list = client.listRecords.bind(client); let renamed = false;
+  client.listRecords = async (...args) => {
+    if (!renamed) {
+      renamed = true; client.rename('owner', '改名后的负责人');
+      client.schema.push({ field_id: 'fldUnrelatedOwner001', field_name: names.owner, type: 11, property: { multiple: false } });
+      client.records.get('recLeadhistory').fields[names.owner] = [{ id: 'ou_offlineSalesB' }];
+    }
+    return list(...args);
+  };
+  const legacy = { legacyRows: [{ id: 'recLeadhistory', state: 'baseline_assigned' }] };
+  await assert.rejects(engine.initialize(legacy), { code: 'SOURCE_SCHEMA_CHANGED_DURING_INITIALIZE' });
+  assert.equal(engine.status().initialized, false); assert.equal(engine.all('v2_snapshots').length, 0); assert.equal(engine.all('v2_outbox').length, 0); assert.equal(engine.all('v2_reviews').length, 0);
+  assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0);
+  await engine.initialize(legacy); await engine.scan({ apply: true });
+  assert.equal(engine.get('v2_snapshots', 'recLeadhistory').view.owner, 'ou_offlineSalesA');
+  assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0);
+});
+for (const state of ['review', 'notification_sending']) test(`legacy ${state} stays quiet but later manual transfers notify the new owner and clearing never auto-refills`, async t => {
+  const legacy = { id: 'recLeaduncertain', state, intendedOwner: 'ou_offlineSalesA', notificationKey: 'offline_legacy_unknown' };
+  const { engine, client } = await fixture(t, { client: new Client([lead('uncertain', { owner: 'ou_offlineSalesA', wxStatus: '未通过' })]), initialize: { legacyRows: [legacy] } });
+  await engine.scan({ apply: true });
+  assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0); assert.equal(engine.all('v2_outbox').length, 0);
+  const historical = engine.all('v2_reviews').find(review => review.code === 'LEGACY_UNRESOLVED'); assert.equal(historical.state, 'open');
+  client.change('recLeaduncertain', { owner: 'ou_offlineSalesB' }); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  assert.deepEqual(client.sent.map(item => item.recipientOpenId), ['ou_offlineSalesB']);
+  let snapshot = engine.get('v2_snapshots', 'recLeaduncertain');
+  assert.equal(snapshot.ownerVersion, 2); assert.equal(snapshot.displayPending, false); assert.equal(snapshot.blocked, true);
+  assert.equal(client.records.get('recLeaduncertain').fields[names.salesName], '模拟销售B');
+  assert.equal(client.writes.every(write => !Object.hasOwn(write.fields, names.owner)), true);
+  assert.equal(engine.get('v2_reviews', historical.id).state, 'open');
+  client.change('recLeaduncertain', { owner: '' }); const writesBeforeClear = client.writes.length;
+  await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  snapshot = engine.get('v2_snapshots', 'recLeaduncertain');
+  assert.equal(snapshot.view.owner, ''); assert.equal(snapshot.autoEligible, false); assert.equal(snapshot.intent, null);
+  assert.equal(client.records.get('recLeaduncertain').fields[names.owner].length, 0); assert.equal(client.writes.length, writesBeforeClear); assert.equal(client.sent.length, 1);
+  client.change('recLeaduncertain', { owner: 'ou_offlineSalesA' }); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  assert.deepEqual(client.sent.map(item => item.recipientOpenId), ['ou_offlineSalesB', 'ou_offlineSalesA']);
+  assert.equal(engine.get('v2_snapshots', 'recLeaduncertain').ownerVersion, 4);
+  assert.equal(engine.get('v2_reviews', historical.id).state, 'open');
+  assert.equal(engine.all('v2_outbox').every(task => task.kind === 'owner' && task.state === 'sent' && task.id !== legacy.notificationKey), true);
+});
+test('latest legacy history is quiet but records not in that backup remain new; old cursor is retained', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('history', { owner: 'ou_offlineSalesA', wxStatus: '未通过', addMethod: '客户主动加' }), lead('new')]),
+    initialize: { legacyRows: [{ id: 'recLeadhistory', state: 'baseline_assigned' }], legacyMeta: { initialized: { at: 'offline' }, lastScan: { scanned: 1 }, 'cursor:飞书派单': 'sales_B' } } });
+  assert.equal(engine.get('v2_snapshots', 'recLeadnew'), null); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineSalesA'); assert.deepEqual(engine.meta('legacy_metadata').lastScan, { scanned: 1 });
+});
+test('legacy waiting details resume, while an old unresolved send is kept in review without replay', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('waiting', { wx: '', needs: '' }), lead('uncertain', { owner: 'ou_offlineSalesA' })]),
+    initialize: { legacyRows: [{ id: 'recLeadwaiting', state: 'awaiting_details' }, { id: 'recLeaduncertain', state: 'notification_sending', intendedOwner: 'ou_offlineSalesA' }] } });
+  client.change('recLeadwaiting', { wx: 'offline_ready', needs: 'ready' }); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(engine.status().reviews >= 1, true);
+});
+test('known numeric rejections retry with a stable UUID and frozen message inside the window', async t => {
+  let clock = 100000; const { engine, client } = await fixture(t, { now: () => clock }); client.add(lead('one')); client.sendError = numericRejection();
+  await engine.scan({ apply: true }); const first = clone(client.sent[0]); assert.equal(engine.status().notifications.pending, 1);
+  clock = 104000; client.sendError = null; await engine.scan({ apply: true }); assert.deepEqual(client.sent[1], first);
+});
+test('unknown send or mirror-create outcomes enter review and are not blindly repeated', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('one')); client.sendError = Object.assign(new Error('private-network-detail'), { code: 'NETWORK_OR_TIMEOUT' });
+  await engine.scan({ apply: true }); client.sendError = null; await engine.scan({ apply: true }); assert.equal(client.sent.length, 1); assert.equal(engine.status().notifications.review, 1);
+  client.add(lead('two')); engine.mirror.error = Object.assign(new Error('offline mirror create'), { code: 'MIRROR_CREATE_REVIEW_REQUIRED' }); await engine.scan({ apply: true }); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(engine.status().notifications.review, 2); assert.equal(JSON.stringify(engine.status()).includes('private-network-detail'), false);
+});
+test('restarts preserve sent messages, process offline new rows, and quarantine interrupted sending markers', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'workflow-v2-engine-')), dbPath = path.join(directory, 'workflow.sqlite'), client = new Client(); let engine;
+  try {
+    engine = new WorkflowEngine({ config: configuration(), client, dbPath }); engine.mirror = new Mirror(engine); await engine.initialize(); client.add(lead('one')); await engine.scan({ apply: true });
+    const sent = engine.all('v2_outbox')[0]; engine.put('v2_outbox', { ...sent, state: 'sending' }); await engine.close();
+    client.add(lead('offline')); engine = new WorkflowEngine({ config: configuration(), client, dbPath }); engine.mirror = new Mirror(engine); await engine.scan({ apply: true });
+    assert.equal(client.sent.length, 2); assert.equal(engine.status().notifications.review, 1); assert.equal(engine.get('v2_snapshots', 'recLeadoffline').view.owner, 'ou_offlineSalesB');
+  } finally { await engine?.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+test('stop before another record preserves the current confirmed owner and pending notice for resume', async t => {
+  const { engine, client } = await fixture(t); client.add(lead('one')); client.add(lead('two')); let stop = false;
+  const update = client.updateRecord.bind(client); client.updateRecord = async (...args) => { const result = await update(...args); stop = true; return result; };
+  await engine.scan({ apply: true, shouldStop: () => stop }); assert.equal(client.writes.length, 1); assert.equal(client.sent.length, 0); assert.equal(engine.get('v2_snapshots', 'recLeadtwo'), null);
+  client.updateRecord = update; stop = false; await engine.scan({ apply: true }); assert.equal(client.sent.length, 2);
+});
+test('real engine and real SalesMirror integrate quiet legacy copy, child feedback, ordered transfer and restart deduplication', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'workflow-v2-integration-')), dbPath = path.join(directory, 'workflow.sqlite'), config = configuration();
+  const source = new Client([lead('history', { owner: 'ou_offlineSalesA' })]), operations = [];
+  class ChildClient {
+    constructor(member) { this.member = member; this.records = new Map(); this.created = 0; }
+    async api(url) { assert.ok(url.includes(`/apps/${this.member.target.appToken}/tables/${this.member.target.tableId}/fields`)); return { items: Object.entries(this.member.target.fields).map(([key, spec]) => ({ field_id: spec.fieldId, field_name: names[key], type: spec.types[0], property: {} })), has_more: false }; }
+    async listRecords(table) { assert.equal(table, this.member.target.tableId); return { items: clone([...this.records.values()]), hasMore: false }; }
+    async readRecord(table, id) { assert.equal(table, this.member.target.tableId); if (!this.records.has(id)) throw Object.assign(new Error('offline child absent'), { code: '1254043' }); return clone(this.records.get(id)); }
+    async createRecord(table, fields) { assert.equal(table, this.member.target.tableId); const id = `recChild${this.member.id}${++this.created}`; const record = { record_id: id, fields: clone(fields) }; this.records.set(id, record); operations.push(`create:${this.member.id}:${id}`); return clone(record); }
+    async updateRecord(table, id, fields) { assert.equal(table, this.member.target.tableId); Object.assign(this.records.get(id).fields, clone(fields)); operations.push(`update:${this.member.id}:${id}`); return clone(this.records.get(id)); }
+    async deleteRecord(table, id) { assert.equal(table, this.member.target.tableId); this.records.delete(id); operations.push(`delete:${this.member.id}:${id}`); }
+  }
+  const children = new Map(config.members.map(member => [member.target.appToken, new ChildClient(member)]));
+  const attach = engine => { engine.mirror = new SalesMirror({ config: engine.config, db: engine.db, sourceClient: source, clientFactory: token => children.get(token), readSource: id => engine.readSourceView(id), resolveSource: () => engine.resolveSource() }); return engine; };
+  let engine;
+  try {
+    engine = attach(new WorkflowEngine({ config, client: source, dbPath }));
+    await engine.initialize({ legacyRows: [{ id: 'recLeadhistory', state: 'baseline_assigned' }], legacyMeta: { initialized: { at: 'offline' }, 'cursor:飞书派单': 'sales_B' } });
+    await engine.scan({ apply: true }); await engine.scan({ apply: true });
+    assert.equal(source.sent.length, 0); assert.equal(children.get(config.members[0].target.appToken).records.size, 1);
+    source.add(lead('new')); await engine.scan({ apply: true });
+    assert.equal(source.sent.length, 1); assert.equal(source.sent[0].recipientOpenId, 'ou_offlineSalesA'); assert.ok(source.sent[0].url.includes('PrivateBaseA12345'));
+    const beforeTransfer = engine.mirror.rows().find(row => row.sourceId === 'recLeadnew' && row.state === 'active');
+    const oldChild = children.get(config.members[0].target.appToken); oldChild.records.get(beforeTransfer.targetRecordId).fields.微信状态 = '未通过';
+    const feedback = await engine.scan({ apply: true });
+    assert.equal(source.records.get('recLeadnew').fields.微信状态, '未通过'); assert.equal(feedback.needsRescan, true); assert.ok(feedback.nextRetryAt <= Date.now() + 1100);
+    assert.equal(source.sent.length, 1); // Feedback is observed by the explicitly requested next scan, not discarded as done.
+    await engine.close(); engine = attach(new WorkflowEngine({ config, client: source, dbPath }));
+    assert.equal(engine.meta('mirror_rescan_needed'), true); // A restart between feedback and observation must not swallow the event.
+    await engine.scan({ apply: true }); assert.equal(source.sent.length, 2); assert.equal(source.sent[1].recipientOpenId, 'ou_offlineOperatorA'); assert.ok(source.sent[1].text.includes('未通过'));
+    source.change('recLeadnew', { owner: 'ou_offlineSalesB' }); await engine.scan({ apply: true });
+    const afterTransfer = engine.mirror.rows().find(row => row.sourceId === 'recLeadnew' && row.state === 'active');
+    assert.equal(oldChild.records.has(beforeTransfer.targetRecordId), false); assert.equal(afterTransfer.owner, 'ou_offlineSalesB');
+    const removedAt = operations.indexOf(`delete:sales_A:${beforeTransfer.targetRecordId}`), createdAt = operations.indexOf(`create:sales_B:${afterTransfer.targetRecordId}`);
+    assert.ok(removedAt >= 0 && createdAt > removedAt); assert.equal(source.sent.length, 3); assert.equal(source.sent[2].recipientOpenId, 'ou_offlineSalesB'); assert.ok(source.sent[2].url.includes('PrivateBaseB12345'));
+    const createdCounts = [...children.values()].map(client => client.created); await engine.close();
+    engine = attach(new WorkflowEngine({ config, client: source, dbPath })); await engine.scan({ apply: true });
+    assert.equal(source.sent.length, 3); assert.deepEqual([...children.values()].map(client => client.created), createdCounts);
+  } finally { await engine?.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+test('events received during mirror synchronization stay pending for the next scan', async t => {
+  const { engine, mirror } = await fixture(t), sync = mirror.sync.bind(mirror);
+  mirror.sync = async options => { engine.acceptEvent({ id: 'late_during_sync', appToken: 'SourceBaseToken12345', tableId: 'tblSourceLeads123', recordIds: ['recLeadlate'] }); return sync(options); };
+  const result = await engine.scan({ apply: true }); assert.equal(engine.status().eventsPending, 1); assert.ok(result.nextRetryAt <= Date.now() + 1100);
+  mirror.sync = sync; await engine.scan({ apply: true }); assert.equal(engine.status().eventsPending, 0);
+});
+test('a field-not-found or a non-record HTTP 404 is not treated as deletion', async t => {
+  for (const error of [Object.assign(new Error('field absent'), { code: '1254044', status: 404 }), Object.assign(new Error('table or access unknown'), { status: 404, code: 'TABLE_OR_ACCESS_UNKNOWN' })]) {
+    const { engine, client } = await fixture(t, { client: new Client([lead('existing', { owner: 'ou_offlineSalesA' })]) });
+    client.change('recLeadexisting', { wxStatus: '未通过' });
+    client.readRecord = async () => { throw error; };
+    await engine.scan({ apply: true });
+    assert.equal(engine.get('v2_snapshots', 'recLeadexisting').deleted, false);
+    assert.equal(engine.all('v2_outbox').some(task => task.state === 'cancelled' && task.errorCode === 'SOURCE_MISSING'), false);
+    assert.equal(client.sent.length, 0);
+  }
+});
