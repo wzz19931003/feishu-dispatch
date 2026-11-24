@@ -10,6 +10,7 @@ const textValue = value => value == null ? '' : Array.isArray(value) ? value.map
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 const personId = value => typeof value === 'string' && /^ou_[A-Za-z0-9_-]{5,}$/.test(value);
 export const EXTRA_SOURCE_FIELDS = { account: [1, 3], channel: [1, 3], leadSource: [1, 3], leadDate: [5] };
+export const SALES_DETAIL_COLUMNS = Object.freeze({ leadDate: { name: '日期', type: 5 }, operatorName: { name: '运营名字', type: 1 } });
 const FIELD_TYPES = { owner: [11], operator: [11], wx: [1], needs: [1], wxStatus: [1, 3], addMethod: [1, 3], partySize: [1, 2], actualSlot: [2], actualSort: [2], salesName: [1], ...EXTRA_SOURCE_FIELDS };
 const REQUIRED_SOURCE = ['owner', 'operator', 'wx', 'needs', 'wxStatus', 'addMethod', 'actualSlot', 'actualSort', 'salesName'];
 const FEEDBACK = ['wxStatus', 'wx', 'needs', 'addMethod', 'partySize'];
@@ -54,6 +55,7 @@ export function validateWorkflowConfig(raw, { requireTargets = true } = {}) {
   if (raw.mirrors !== undefined && !object(raw.mirrors)) fail('MIRRORS_INVALID');
   if (raw.mirrors?.enabled !== undefined && typeof raw.mirrors.enabled !== 'boolean') fail('MIRRORS_INVALID');
   if (raw.mirrors?.enabled === false) fail('MIRRORS_REQUIRED');
+  if (raw.mirrors?.salesDetails !== undefined && typeof raw.mirrors.salesDetails !== 'boolean') fail('MIRRORS_INVALID');
   const feedbackFields = raw.mirrors?.feedbackFields ?? ['wxStatus'];
   if (!Array.isArray(feedbackFields) || !feedbackFields.includes('wxStatus') || new Set(feedbackFields).size !== feedbackFields.length || feedbackFields.some(key => !FEEDBACK.includes(key) || !fields[key])) fail('FEEDBACK_FIELDS_INVALID');
   if (!Array.isArray(raw.members) || !raw.members.length) fail('MEMBERS_REQUIRED');
@@ -83,11 +85,13 @@ export function validateWorkflowConfig(raw, { requireTargets = true } = {}) {
   if(staffManagement&&members.some(member=>member.target?.appToken===staffManagement.appToken))fail('STAFF_TARGET_COLLISION');
   return { appId: raw.appId, appSecret: raw.appSecret.trim(), appToken: raw.appToken, baseUrl, tableIds: { leads: raw.tableIds.leads }, fields: { leads: fields }, members,
     enabled: raw.enabled === true, notification: { enabled: raw.notification?.enabled === true, title: raw.notification?.title || '新客资待跟进' }, requiredLeadFields: ['wx', 'needs'],
-    allowedHost: raw.allowedHost.trim(), pollSeconds, dbPath: 'data/workflow.sqlite', events: raw.events !== false, mirrors: { enabled: true, feedbackFields: [...feedbackFields] }, pendingTargets, ...(staffManagement?{staffManagement}:{}) };
+    allowedHost: raw.allowedHost.trim(), pollSeconds, dbPath: 'data/workflow.sqlite', events: raw.events !== false,
+    mirrors: { enabled: true, feedbackFields: [...feedbackFields],
+      ...(typeof raw.mirrors?.salesDetails === 'boolean' ? { salesDetails: raw.mirrors.salesDetails } : {}) },
+    pendingTargets, ...(staffManagement?{staffManagement}:{}) };
 }
 
-export async function resolveFields(client, { appToken, tableId, fields }) {
-  const definitions = fieldDefinitions(fields);
+export async function listFieldMetadata(client, { appToken, tableId }) {
   if (!/^[A-Za-z0-9]{10,}$/.test(appToken || '') || !/^tbl[A-Za-z0-9]{5,}$/.test(tableId || '')) fail('RESOURCE_INVALID');
   const schema = [], seen = new Set(); let token;
   do {
@@ -98,6 +102,11 @@ export async function resolveFields(client, { appToken, tableId, fields }) {
     if (!nonempty(page.page_token) || seen.has(page.page_token) || seen.size >= 1000) fail('FIELD_PAGINATION_INVALID');
     token = page.page_token; seen.add(token);
   } while (true);
+  return schema;
+}
+export async function resolveFields(client, { appToken, tableId, fields }, { observeSchema } = {}) {
+  const definitions = fieldDefinitions(fields);
+  const schema = await listFieldMetadata(client, { appToken, tableId });
   const result = {};
   for (const [key, spec] of Object.entries(definitions)) {
     const matches = schema.filter(field => field.field_id === spec.fieldId);
@@ -107,6 +116,7 @@ export async function resolveFields(client, { appToken, tableId, fields }) {
     if (spec.multiple === false && field.property?.multiple !== false) fail('SINGLE_PERSON_REQUIRED');
     result[key] = { fieldId: spec.fieldId, name: field.field_name, type, property: structuredClone(field.property || {}) };
   }
+  observeSchema?.(schema);
   return result;
 }
 function person(value) {
@@ -137,6 +147,10 @@ export function encodePatch(logical, resolved) {
     const spec = resolved[key]; if (!spec) fail('PATCH_FIELD_UNMAPPED');
     if (spec.type === 11) { if (value !== '' && value != null && !personId(value)) fail('PATCH_PERSON_INVALID'); patches.push([spec.name, value ? [{ id: value }] : []]); }
     else if (spec.type === 2) { if (value != null && (typeof value !== 'number' || !Number.isFinite(value))) fail('PATCH_NUMBER_INVALID'); patches.push([spec.name, value]); }
+    else if (spec.type === 5) {
+      if (value != null && (!Number.isSafeInteger(value) || !Number.isFinite(new Date(value).getTime()))) fail('PATCH_DATE_INVALID');
+      patches.push([spec.name, value ?? null]);
+    }
     else if (spec.type === 1 || spec.type === 3) {
       if (value != null && typeof value !== 'string') fail('PATCH_TEXT_INVALID');
       const text = value?.trim() || '';

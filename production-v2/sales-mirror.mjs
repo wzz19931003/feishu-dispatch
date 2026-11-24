@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { resolveFields, recordView, encodePatch } from './field-map.mjs';
+import { resolveFields, listFieldMetadata, recordView, encodePatch, SALES_DETAIL_COLUMNS } from './field-map.mjs';
 
 export class SalesMirrorError extends Error {
   constructor(code) { super(`销售镜像处理未完成（${code}）`); this.name = 'SalesMirrorError'; this.code = code; }
@@ -12,6 +12,8 @@ const absent = error => ['1254043', 'RECORD_NOT_FOUND', 'SOURCE_RECORD_NOT_FOUND
 const COPY_FIELDS = Object.freeze(['wx', 'needs', 'wxStatus', 'addMethod', 'partySize', 'salesName']);
 const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'addMethod', 'partySize']);
 const STATUS_WRITEBACK_UNCONFIRMED = 'MIRROR_STATUS_WRITEBACK_OUTCOME_UNKNOWN';
+const SALES_DETAIL_BATCH_SIZE = 4;
+const SALES_DETAIL_BUDGET_MS = 2500;
 const equal = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
 const targetIdentity = target => JSON.stringify([target.appToken, target.tableId]);
 const stopped = shouldStop => { try { return Boolean(shouldStop?.()); } catch { return true; } };
@@ -37,16 +39,22 @@ async function records(client, target) {
   return result;
 }
 
-/** Uses only its own two tables in the caller-owned SQLite connection. */
+/** Uses only its own tables in the caller-owned SQLite connection. */
 export class SalesMirror {
-  constructor({ config, db, sourceClient, clientFactory, readSource, resolveSource, now = Date.now } = {}) {
+  constructor({ config, db, sourceClient, clientFactory, readSource, resolveSource, operatorNames, auditDetailsTarget, now = Date.now } = {}) {
     if (!config || !db?.prepare || !sourceClient || typeof clientFactory !== 'function' || typeof readSource !== 'function' || typeof resolveSource !== 'function') fail('MIRROR_ARGUMENTS_REQUIRED');
     this.config = config; this.db = db; this.sourceClient = sourceClient; this.clientFactory = clientFactory; this.readSource = readSource; this.resolveSource = resolveSource; this.busy = false;
     this.now = now; this.sourceMutationCount = 0;
+    this.operatorNames = operatorNames;
+    this.auditDetailsTarget = auditDetailsTarget;
+    this.detailEnabled = config.staffManagement?.enabled === true && config.mirrors?.salesDetails !== false
+      && Boolean(config.fields?.leads?.leadDate);
+    this.detailCursor = '';
     const feedback = config.mirrors?.feedbackFields || ['wxStatus'];
     if (!Array.isArray(feedback) || !feedback.includes('wxStatus') || feedback.some(key => !FEEDBACK_FIELDS.has(key)) || new Set(feedback).size !== feedback.length) fail('MIRROR_FEEDBACK_INVALID');
     this.feedback = [...feedback];
     db.exec('CREATE TABLE IF NOT EXISTS v2_mirrors (id TEXT PRIMARY KEY,source_id TEXT NOT NULL,version INTEGER NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL); CREATE INDEX IF NOT EXISTS v2_mirrors_source ON v2_mirrors(source_id,version); CREATE TABLE IF NOT EXISTS v2_mirror_reviews (id TEXT PRIMARY KEY,data TEXT NOT NULL);');
+    if (this.detailEnabled) db.exec('CREATE TABLE IF NOT EXISTS v2_sales_detail_pins (target TEXT PRIMARY KEY, date_id TEXT NOT NULL, operator_name_id TEXT NOT NULL);');
     for (const row of this.rows()) if (row.sourceAppToken !== config.appToken || row.sourceTableId !== config.tableIds.leads) fail('MIRROR_DATABASE_BINDING_MISMATCH');
     // An interrupted create can already have succeeded remotely. Do not POST again.
     for (const row of this.rows()) if (row.state === 'creating') {
@@ -104,6 +112,112 @@ export class SalesMirror {
     const result = {};
     for (const key of COPY_FIELDS) if (resolved[key] && (key === 'salesName' || this.config.fields?.leads?.[key])) result[key] = key === 'salesName' ? member.displayName : view[key] ?? (resolved[key].type === 2 ? null : '');
     return result;
+  }
+  detailFields(member, schema) {
+    const { target } = member;
+    const requiredIds = new Set(Object.values(target.fields).map(spec => spec.fieldId));
+    const result = {};
+    for (const [logical, { name, type }] of Object.entries(SALES_DETAIL_COLUMNS)) {
+      const matches = schema.filter(field => field.field_name === name);
+      if (matches.length !== 1) return null;
+      const field = matches[0];
+      if (Number(field.type) !== type || !/^fld[A-Za-z0-9]{5,}$/.test(field.field_id) || requiredIds.has(field.field_id)) return null;
+      requiredIds.add(field.field_id);
+      result[logical] = { fieldId: field.field_id, name, type };
+    }
+    const previous = this.db.prepare('SELECT date_id,operator_name_id FROM v2_sales_detail_pins WHERE target=?').get(targetIdentity(target));
+    if (previous && (previous.date_id !== result.leadDate.fieldId || previous.operator_name_id !== result.operatorName.fieldId)) return null;
+    return result;
+  }
+  detailValues(view, fields, names) {
+    const values = {};
+    if (fields.leadDate && Object.hasOwn(view, 'leadDate')) values.leadDate = view.leadDate;
+    if (fields.operatorName) {
+      const name = view.operator ? names.get(view.operator) : '';
+      if (typeof name === 'string' && name.length <= 200) values.operatorName = name;
+    }
+    return values;
+  }
+  async syncDetails(views, childSnapshots, sourceResolved, shouldStop) {
+    const counts = { detailWrites: 0, detailReviews: 0, detailFieldsReady: 0 };
+    if (typeof this.operatorNames !== 'function' || typeof this.auditDetailsTarget !== 'function') return { ...counts, detailReviews: 1 };
+    const names = this.operatorNames();
+    if (!(names instanceof Map)) return counts;
+    const fieldsByTarget = new Map();
+    const members = new Map(this.config.members.filter(member => member.target).map(member => [member.openId, member]));
+    const expiredAt = performance.now() + SALES_DETAIL_BUDGET_MS;
+    const budgetEnded = () => stopped(shouldStop) || performance.now() >= expiredAt;
+    for (const member of members.values()) {
+      if (budgetEnded()) return counts;
+      const key = targetIdentity(member.target), schema = childSnapshots.get(key)?.schema;
+      if (!schema) continue;
+      const fields = this.detailFields(member, schema);
+      if (fields) fieldsByTarget.set(key, fields);
+    }
+    const candidates = [];
+    const mappings = new Map(this.rows().filter(row => row.state !== 'revoked').map(row => [row.sourceId, row]));
+    for (const view of views) {
+      const member = members.get(view.owner), row = mappings.get(view.id);
+      if (!member || row?.state !== 'active' || !row.targetRecordId || row.owner !== view.owner || row.memberId !== member.id) continue;
+      const key = targetIdentity(member.target);
+      if (targetIdentity(row.target) !== key) continue;
+      const fields = fieldsByTarget.get(key), record = childSnapshots.get(key)?.records.get(row.targetRecordId);
+      if (!fields || !record) continue;
+      try {
+        const targetView = recordView(record, fields);
+        const values = this.detailValues(view, fields, names);
+        if (Object.entries(values).some(([logical, value]) => !equal(targetView[logical], value))) candidates.push({ row, member, fields });
+      } catch { counts.detailReviews++; }
+    }
+    candidates.sort((a, b) => a.row.sourceId < b.row.sourceId ? -1 : a.row.sourceId > b.row.sourceId ? 1 : 0);
+    const next = candidates.findIndex(({ row }) => row.sourceId > this.detailCursor);
+    const start = Math.max(0, next);
+    const rejected = new Set(), audited = new Set();
+    let attempts = 0;
+    for (const { row, member, fields } of [...candidates.slice(start), ...candidates.slice(0, start)]) {
+      if (budgetEnded() || attempts >= SALES_DETAIL_BATCH_SIZE) return counts;
+      this.detailCursor = row.sourceId;
+      const key = targetIdentity(member.target);
+      if (rejected.has(key)) continue;
+      attempts++;
+      try {
+        if (await this.auditDetailsTarget(member, budgetEnded) !== true) {
+          rejected.add(key); counts.detailReviews++; continue;
+        }
+      } catch {
+        rejected.add(key); counts.detailReviews++; continue;
+      }
+      if (!audited.has(key)) {
+        audited.add(key);
+        counts.detailFieldsReady += 2;
+      }
+      try {
+        if (budgetEnded()) return counts;
+        const record = await this.targetRecord(row);
+        if (!record) continue;
+        if (budgetEnded()) return counts;
+        const current = await this.sourceClient.readRecord(this.config.tableIds.leads, row.sourceId);
+        const fresh = recordView(current, sourceResolved);
+        if (fresh.id !== row.sourceId || fresh.owner !== row.owner) continue;
+        if (budgetEnded()) return counts;
+        if (fingerprint(sourceResolved) !== fingerprint(await this.resolveSource())) { counts.detailReviews++; continue; }
+        if (budgetEnded()) return counts;
+        const schema = await listFieldMetadata(this.clientFactory(member.target.appToken), member.target);
+        const atWrite = this.detailFields(member, schema);
+        if (fingerprint(atWrite) !== fingerprint(fields)) { counts.detailReviews++; continue; }
+        const targetView = recordView(record, atWrite);
+        const values = this.detailValues(fresh, atWrite, names);
+        const patch = Object.fromEntries(Object.entries(values).filter(([logical, value]) => !equal(targetView[logical], value)));
+        if (!Object.keys(patch).length) continue;
+        if (budgetEnded()) return counts;
+        this.checkWrite(shouldStop);
+        this.db.prepare('INSERT OR IGNORE INTO v2_sales_detail_pins(target,date_id,operator_name_id) VALUES(?,?,?)')
+          .run(key, atWrite.leadDate.fieldId, atWrite.operatorName.fieldId);
+        await this.clientFactory(row.target.appToken).updateRecord(row.target.tableId, row.targetRecordId, encodePatch(patch, atWrite));
+        counts.detailWrites++;
+      } catch { counts.detailReviews++; }
+    }
+    return counts;
   }
   url(row) { const url = new URL(row.target.baseUrl); url.searchParams.set('table', row.target.tableId); url.searchParams.set('record', row.targetRecordId); return url.href; }
   async targetRecord(row) {
@@ -282,8 +396,11 @@ export class SalesMirror {
         const resolved = await resolveFields(client, member.target);
         for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
         const childRecords = await records(client, member.target);
-        if (fingerprint(resolved) !== fingerprint(await resolveFields(client, member.target))) fail('MIRROR_TARGET_SCHEMA_CHANGED_DURING_SCAN');
-        childSnapshots.set(targetIdentity(member.target), { resolved, records: new Map(childRecords.map(record => [record.record_id || record.recordId || record.id, record])) });
+        let schema;
+        const verified = await resolveFields(client, member.target,
+          this.detailEnabled ? { observeSchema: fields => { schema = fields; } } : undefined);
+        if (fingerprint(resolved) !== fingerprint(verified)) fail('MIRROR_TARGET_SCHEMA_CHANGED_DURING_SCAN');
+        childSnapshots.set(targetIdentity(member.target), { resolved, schema, records: new Map(childRecords.map(record => [record.record_id || record.recordId || record.id, record])) });
       }
       const present = new Set();
       const views = sourceViews || sourceRecords.map(record => {
@@ -335,7 +452,12 @@ export class SalesMirror {
           for (const record of childRecords) { const id = record.record_id || record.recordId || record.id; if (!known.has(id)) { counts.unknownChildRecords++; this.review('MIRROR_UNTRUSTED_CHILD_RECORD', '', '', { targetAppToken: member.target.appToken, targetRecordId: id }); } }
         } catch (error) { this.review(safeCode(error)); counts.reviews++; }
       }
-      return { ...counts, sourceWrites: this.sourceMutationCount - mutationsBefore, ...this.status(), busy: false };
+      let detailCounts = {};
+      if (!counts.stopped && this.detailEnabled) {
+        try { detailCounts = await this.syncDetails(views, childSnapshots, sourceResolved, shouldStop); }
+        catch { detailCounts = { detailReviews: 1 }; }
+      }
+      return { ...counts, ...detailCounts, sourceWrites: this.sourceMutationCount - mutationsBefore, ...this.status(), busy: false };
     });
   }
 }

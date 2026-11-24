@@ -31,12 +31,12 @@ const staffRow = ({ id, openId, name, role = '销售', enabled = true, order = n
 function configuration() {
   return { appId: 'cli_runtime_fixture', appSecret: 'fake-runtime-fixture-secret', appToken: SOURCE,
     baseUrl: `https://runtime.feishu.cn/base/${SOURCE}`, tableIds: { leads: SOURCE_TABLE }, fields: { leads: sourceDefinitions() },
-    members: [1, 2].map(number => ({ id: `sales_slot_${number}`, openId: `ou_seed_sales_${number}12345`, displayName: number === 1 ? '示例销售甲' : '示例销售乙', order: number, enabled: true, target: seedTarget(number) })),
+    members: [1, 2].map(number => ({ id: `sales_slot_${number}`, openId: `ou_seed_sales_${number}12345`, displayName: number === 1 ? '魏琳娜' : '罗子安', order: number, enabled: true, target: seedTarget(number) })),
     enabled: true, notification: { enabled: true }, allowedHost: 'OFFLINE-RUNTIME-ONLY', dbPath: 'data/workflow.sqlite',
     mirrors: { enabled: true, feedbackFields: ['wxStatus'] }, requiredLeadFields: ['wx', 'needs'], events: true, pollSeconds: 600,
     staffManagement: { enabled: true, appToken: STAFF, tableId: STAFF_TABLE,
       fields: Object.fromEntries(Object.entries(staffTypes).map(([key, type]) => [key, { fieldId: `fldRuntimeStaff${key}`, types: [type], ...(key === 'employee' ? { multiple: false } : {}) }])),
-      fixedReaders: [{ openId: 'ou_runtime_manager_0001', displayName: '示例管理员甲' }, { openId: 'ou_seed_sales_212345', displayName: '示例销售乙' }, { openId: 'ou_seed_sales_112345', displayName: '示例销售甲' }, { openId: 'ou_runtime_manager_0002', displayName: '示例管理员乙' }],
+      fixedReaders: [{ openId: 'ou_runtime_manager_0001', displayName: '吴忠展' }, { openId: 'ou_seed_sales_212345', displayName: '罗子安' }, { openId: 'ou_seed_sales_112345', displayName: '魏琳娜' }, { openId: 'ou_runtime_manager_0002', displayName: '周婷' }],
       operatorFormUrl: 'https://runtime.feishu.cn/share/base/form/shrRuntimeOperator123', seedRecordIds: ['recRuntimeSeed1', 'recRuntimeSeed2', 'recRuntimeOperator'] } };
 }
 function schema(definitions, names) {
@@ -115,7 +115,7 @@ class Service {
     else assert.equal(call.method, 'GET');
     return { record: clone(table.records.get(recordId)) };
   }
-  onboardingMutations() { return this.calls.filter(call => call.method !== 'GET' && (call.endpoint === '/open-apis/bitable/v1/apps' || /\/tables$|\/permissions\/|\/subscribe$/.test(call.endpoint) || call.endpoint === '/open-apis/im/v1/messages' && JSON.parse(call.body.content).text.includes('飞书派单工作入口'))); }
+  onboardingMutations() { return this.calls.filter(call => call.method !== 'GET' && (call.endpoint === '/open-apis/bitable/v1/apps' || /\/tables$|\/permissions\/|\/subscribe$/.test(call.endpoint) || call.endpoint === '/open-apis/im/v1/messages' && JSON.parse(call.body.content).text.includes('拾野记工作入口'))); }
 }
 class MemoryClient extends WorkflowClient {
   constructor(config, service) { super(config, { fetchImpl: async () => { throw new Error('REAL_NETWORK_FORBIDDEN'); } }); this.service = service; }
@@ -158,7 +158,7 @@ test('real createEngine + staff modules prepare a new target and assign a new le
   assert.equal(f.service.table(member.target.appToken, member.target.tableId).records.size, 1);
   assert.equal(f.service.messages.length, 2);
   const text = f.service.messages.map(message => JSON.parse(message.content).text);
-  assert.equal(text.filter(value => value.includes('飞书派单工作入口')).length, 1);
+  assert.equal(text.filter(value => value.includes('拾野记工作入口')).length, 1);
   assert.ok(text.every(value => !value.includes(`/base/${SOURCE}`)));
   assert.deepEqual(JSON.parse(readFileSync(f.file, 'utf8')).members, originalMembers);
   const createdBefore = f.service.created, messagesBefore = f.service.messages.length;
@@ -214,6 +214,40 @@ test('real v2.2 engine, roster and operator mirror keep operator views private w
   await f.engine.scan({ apply: true });
   assert.equal(f.service.messages.length, 2);
 });
+test('staff-enabled runner auto-enables scalar sync per exact private sales schema, without changing private config', async t => {
+  const config = configuration();
+  config.fields.leads.leadDate = { fieldId: 'fldRuntimeSourceDate', types: [5] };
+  const [first, second] = config.members;
+  const date = 1_760_000_000_000;
+  const f = await fixture(t, config, service => {
+    for (const member of [first, second]) {
+      const { appToken, tableId } = member.target;
+      service.table(appToken, tableId).fields.push({ field_id: 'fldRuntimeDetailDate', field_name: '日期', type: 5 });
+    }
+    service.table(first.target.appToken, first.target.tableId).fields
+      .push({ field_id: 'fldRuntimeDetailOperator', field_name: '运营名字', type: 1 });
+    const source = service.table(SOURCE, SOURCE_TABLE).records;
+    for (const member of [first, second]) {
+      const id = member === first ? 'recRuntimeDetailsFirst' : 'recRuntimeDetailsSecond';
+      source.set(id, { record_id: id, fields: { 负责人: [{ id: member.openId }], 录入运营: [{ id: 'ou_runtime_operator_0001' }],
+        微信号: 'fixture-customer', '客户需求（天数/景点/预算等）': 'fixture-needs', 微信状态: '通过', 添加方式: '销售主动加', 日期: date } });
+    }
+  });
+  await f.engine.scan({ apply: true });
+  await f.engine.scan({ apply: true });
+  const records = member => f.service.table(member.target.appToken, member.target.tableId).records;
+  assert.equal([...records(first).values()][0].fields.日期, date);
+  assert.equal([...records(first).values()][0].fields.运营名字, '离线录入运营');
+  assert.equal([...records(second).values()][0].fields.日期, undefined);
+  f.service.bases.get(first.target.appToken).members.set('ou_unapproved_reader_0001', 'view');
+  f.service.table(SOURCE, SOURCE_TABLE).records.get('recRuntimeDetailsFirst').fields.日期 = date + 86400000;
+  await f.engine.scan({ apply: true });
+  assert.equal([...records(first).values()][0].fields.日期, date);
+  assert.equal(f.engine.status().mirror.detailWrites, 0);
+  assert.deepEqual(JSON.parse(readFileSync(f.file, 'utf8')).mirrors, config.mirrors);
+  assert.equal(f.service.messages.length, 0);
+});
+
 test('one fake WS routes only exact employee Base/table and recognizes newly ready child target dynamically', async t => {
   const f = await fixture(t); await f.engine.scan({ apply: true }); f.addNewEmployee(); await f.engine.scan({ apply: true });
   let constructed = 0, closed = 0, handler;

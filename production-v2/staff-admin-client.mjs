@@ -1,5 +1,5 @@
 import { WorkflowClient } from './client.mjs';
-import { resolveFields } from './field-map.mjs';
+import { resolveFields, SALES_DETAIL_COLUMNS } from './field-map.mjs';
 
 export const STAFF_TARGET_NAMES = Object.freeze({ wx: '微信号', needs: '客户需求（天数/景点/预算等）', wxStatus: '微信状态', addMethod: '添加方式', partySize: '出游人数' });
 export const OPERATOR_TARGET_NAMES = Object.freeze({ ...STAFF_TARGET_NAMES, account: '平台账号名称', channel: '渠道',
@@ -61,12 +61,14 @@ export class StaffAdminClient extends WorkflowClient {
     }, beforeMutation);
   }
   async businessHeaders() {
-    const keys = ['wx', 'needs', 'wxStatus', 'addMethod', ...(this.config.fields?.leads?.partySize ? ['partySize'] : [])];
+    const optional = this.config.mirrors?.salesDetails === true;
+    const keys = ['wx', 'needs', 'wxStatus', 'addMethod', ...(this.config.fields?.leads?.partySize ? ['partySize'] : []),
+      ...(optional && this.config.fields?.leads?.leadDate ? ['leadDate'] : [])];
     const definitions = Object.fromEntries(keys.map(key => [key, this.config.fields?.leads?.[key]]));
     const source = await resolveFields(this, { appToken: this.config.appToken, tableId: this.config.tableIds?.leads, fields: definitions });
     if (source.wx.type !== 1 || source.needs.type !== 1 || source.wxStatus.type !== 3 || source.addMethod.type !== 3
       || source.partySize && ![1, 2].includes(source.partySize.type)) fail('STAFF_SOURCE_FIELD_TYPE_INVALID');
-    return Object.entries(STAFF_TARGET_NAMES).map(([key, field_name]) => {
+    const headers = Object.entries(STAFF_TARGET_NAMES).map(([key, field_name]) => {
       const field = { field_name, type: source[key]?.type ?? 1 };
       if (field.type === 3) {
         const options = source[key].property?.options;
@@ -76,6 +78,16 @@ export class StaffAdminClient extends WorkflowClient {
       }
       return field;
     });
+    if (optional) {
+      const { name: dateName, type: dateType } = SALES_DETAIL_COLUMNS.leadDate;
+      const { name: operatorName, type: operatorType } = SALES_DETAIL_COLUMNS.operatorName;
+      if (source.leadDate?.type === dateType) {
+        const formatter = source.leadDate.property?.date_formatter;
+        headers.push({ field_name: dateName, type: dateType, ...(typeof formatter === 'string' && formatter ? { property: { date_formatter: formatter } } : {}) });
+      }
+      headers.push({ field_name: operatorName, type: operatorType });
+    }
+    return headers;
   }
   async createBusinessTable(appToken, { beforeMutation } = {}) {
     this.employeeBase(appToken);
@@ -186,7 +198,7 @@ export class StaffAdminClient extends WorkflowClient {
       || employee.role === 'sales' && (parsed.search || !/^\/base\/[A-Za-z0-9]{10,100}\/?$/.test(parsed.pathname) || parsed.pathname.includes(this.config.appToken))
       || employee.role === 'operator' && !/^\/share\/(?:base\/)?form\/[A-Za-z0-9_-]+\/?$/.test(parsed.pathname)
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientToken ?? '')) fail('STAFF_ENTRY_URL_INVALID');
-    const notification = { recipientOpenId: employee.openId, title: '飞书派单工作入口',
+    const notification = { recipientOpenId: employee.openId, title: '拾野记工作入口',
       text: employee.role === 'sales' ? '请通过以下个人表查看和更新分配给你的客资。' : '请通过以下表单录入客资。', url, idempotencyKey: clientToken };
     return this.mutation(() => this.sourceClient ? this.sourceClient.sendNotification(notification) : super.sendNotification(notification), beforeMutation);
   }

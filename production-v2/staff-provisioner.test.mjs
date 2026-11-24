@@ -198,7 +198,7 @@ function adapterFixture({ beforeTablePost } = {}) {
     if (endpoint.endsWith('/fields')) { await beforeTablePost?.(); return { items: sourceFields, has_more: false }; }
     if (endpoint === '/open-apis/bot/v3/info') return { bot: { open_id: 'ou_our_app_bot_0001' } };
     if (endpoint.endsWith('/members') && !request.method) return { items: [{ member_type: 'openid', member_id: 'ou_our_app_bot_0001', perm: 'full_access' }, { member_type: 'openid', member_id: 'ou_other_owner_0001', perm: 'owner', is_owner: true }] };
-    if (endpoint.endsWith('/tables')) return { table_id: 'tblNewBusiness123', field_id_list: keys.map((_, index) => `fldNewBusiness${index}`) };
+    if (endpoint.endsWith('/tables')) return { table_id: 'tblNewBusiness123', field_id_list: request.body.table.fields.map((_, index) => `fldNewBusiness${index}`) };
     if (endpoint === '/open-apis/bitable/v1/apps') return { app: { app_token: newBase, url: target().baseUrl, default_table_id: 'tblUnusedDefault123' } };
     return {};
   }, async sendNotification(payload) { calls.push({ notification: payload }); return { messageId: 'om_adapter_welcome' }; } };
@@ -213,6 +213,19 @@ test('admin adapter strict mutation transport, source-ID enums, one table POST a
   assert.deepEqual(posts[0].body.table.fields[2].property.options.map(option => option.name), options.wxStatus);
   assert.ok(posts[0].body.table.fields[2].property.options.every(option => !Object.hasOwn(option, 'id')));
   assert.ok(!f.calls.some(call => /space|visibility|delete/i.test(call.endpoint ?? '')));
+});
+test('new sales tables add the optional date and operator text while leaving core field pins unchanged', async () => {
+  const f = adapterFixture();
+  f.cfg.mirrors.salesDetails = true;
+  f.cfg.fields.leads.leadDate = { fieldId: 'fldSourceDate000', types: [5] };
+  f.sourceFields.push({ field_id: 'fldSourceDate000', field_name: '日期', type: 5, property: { date_formatter: 'yyyy/MM/dd' } });
+  const result = await f.client.createBusinessTable(newBase);
+  const columns = f.calls.find(call => call.method === 'POST').body.table.fields;
+  assert.deepEqual(columns.slice(5), [
+    { field_name: '日期', type: 5, property: { date_formatter: 'yyyy/MM/dd' } },
+    { field_name: '运营名字', type: 1 },
+  ]);
+  assert.deepEqual(Object.keys(result.fields), keys);
 });
 test('adapter performs employee guard after internal source schema GET, before real table mutation', async () => {
   let changed = false; const f = adapterFixture({ beforeTablePost: async () => { changed = true; } });

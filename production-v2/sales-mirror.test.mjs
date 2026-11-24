@@ -51,16 +51,25 @@ class FakeClient {
   }
 }
 
-function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:' } = {}) {
+function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails } = {}) {
   const log = [], source = new FakeClient(sourceToken, 'tblSourceFixture001', schema('Source'), log);
   const childSchema = schema('Child').filter(field => !['owner', 'operator'].includes(field.key));
   const salesA = new FakeClient('SalesAFixtureBase012345', 'tblSalesAFixture001', childSchema, log);
   const salesB = new FakeClient('SalesBFixtureBase012345', 'tblSalesBFixture001', childSchema, log);
-  const target = client => ({ appToken: client.base, tableId: client.table, baseUrl: `https://fixture.feishu.cn/base/${client.base}`, fields: definitions(client.schema) });
+  if (detailColumns) {
+    source.schema.push({ key: 'leadDate', field_id: 'fldSourceDate000', field_name: '日期', type: 5 });
+    for (const child of [salesA, salesB]) child.schema.push(
+      { field_id: 'fldChildDate000', field_name: '日期', type: 5 },
+      { field_id: 'fldChildOperator000', field_name: '运营名字', type: 1 },
+    );
+  }
+  const target = client => ({ appToken: client.base, tableId: client.table, baseUrl: `https://fixture.feishu.cn/base/${client.base}`, fields: definitions(client.schema.filter(field => field.key)) });
   const config = { enabled: true, appToken: sourceToken, tableIds: { leads: source.table }, fields: { leads: definitions(source.schema) }, mirrors: { enabled: true, feedbackFields }, members: [
     { id: 'sales_a', openId: 'ou_fixture_sales_a', displayName: 'Fixture A', enabled: true, order: 1, target: target(salesA) },
     { id: 'sales_b', openId: 'ou_fixture_sales_b', displayName: 'Fixture B', enabled: true, order: 2, target: target(salesB) },
   ] };
+  if (detailColumns) config.staffManagement = { enabled: true };
+  if (salesDetails !== undefined) config.mirrors.salesDetails = salesDetails;
   source.records.set('recSource1', { record_id: 'recSource1', fields: { Owner: [{ id: 'ou_fixture_sales_a' }], Operator: [{ id: 'ou_fixture_operator' }], Wechat: 'fixture-wx', Needs: 'fixture-needs', 'Wechat status': '未添加', 'Add method': '客户主动加', 'Party size': 2, 'Sales name': 'Fixture A', FinanceSecret: 12345 } });
   let sourceReadCount = 0;
   const hooks = {};
@@ -70,7 +79,9 @@ function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:' } = {}) 
     const record = await source.readRecord(source.table, id); return recordView(record, await resolveSource());
   };
   const db = new DatabaseSync(filename), clients = new Map([source, salesA, salesB].map(client => [client.base, client]));
-  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource });
+  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource,
+    operatorNames: () => hooks.staffUnhealthy ? null : new Map([['ou_fixture_operator', '离线运营']]),
+    auditDetailsTarget: async member => hooks.auditDetailsTarget?.(member) ?? true });
   const mirror = construct();
   return { db, mirror, construct, config, source, salesA, salesB, log, hooks, readSource, resolveSource, close() { db.close(); } };
 }
@@ -118,6 +129,94 @@ test('feedback is restricted to configured whitelist and readonly copied values 
     assert.equal(f.source.records.get('recSource1').fields.Wechat, 'fixture-wx');
     assert.equal(f.salesA.records.get(targetRecordId).fields.Wechat, 'fixture-wx');
     assert.equal(f.source.records.get('recSource1').fields.FinanceSecret, 12345);
+  } finally { f.close(); }
+});
+
+test('sales detail backfill keeps existing record, corrects personal edits and never writes extras back to the source', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    const source = f.source.records.get('recSource1');
+    source.fields['日期'] = 1_760_000_000_000;
+    const assignment = await f.mirror.ensure({ id: 'recSource1' });
+    const { fields } = f.salesA.records.get(assignment.targetRecordId);
+    assert.equal(fields['日期'], undefined);
+    const first = await f.mirror.sync();
+    assert.equal(first.detailWrites, 1);
+    const target = f.salesA.records.get(assignment.targetRecordId);
+    assert.equal(target.fields['日期'], 1_760_000_000_000);
+    assert.equal(target.fields['运营名字'], '离线运营');
+    assert.equal(f.salesB.records.size, 0);
+    assert.equal((await f.mirror.sync()).detailWrites, 0);
+    target.fields['运营名字'] = '自行编辑';
+    target.fields['Wechat status'] = '未通过';
+    source.fields['日期'] = null;
+    const update = await f.mirror.sync();
+    assert.equal(update.detailWrites, 1);
+    assert.equal(update.sourceWrites, 1);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], null);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['运营名字'], '离线运营');
+    assert.deepEqual(f.log.filter(entry => entry.base === sourceToken && entry.op === 'update').map(entry => entry.fields), [{ 'Wechat status': '未通过' }]);
+    assert.equal(createCount(f), 1);
+  } finally { f.close(); }
+});
+
+test('sales details require both columns and current access before first pin, and stop if ownership or field IDs change', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    const source = f.source.records.get('recSource1');
+    source.fields['日期'] = 1_760_000_000_000;
+    const assignment = await f.mirror.ensure({ id: 'recSource1' });
+    f.hooks.auditDetailsTarget = () => false;
+    assert.equal((await f.mirror.sync()).detailWrites, 0);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM v2_sales_detail_pins').get().count, 0);
+    f.hooks.auditDetailsTarget = () => true;
+    f.salesA.hooks.beforeRead = () => owner(f, 'ou_fixture_sales_b');
+    assert.equal((await f.mirror.sync()).detailWrites, 0);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
+    delete f.salesA.hooks.beforeRead;
+    owner(f, 'ou_fixture_sales_a');
+    const result = await f.mirror.sync();
+    assert.equal(result.detailWrites, 1);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], 1_760_000_000_000);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['运营名字'], '离线运营');
+    f.salesA.schema.find(field => field.field_name === '运营名字').field_id = 'fldUnpinnedOperator000';
+    source.fields['日期'] = 1_790_000_000_000;
+    assert.equal((await f.mirror.sync()).detailWrites, 0);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], 1_760_000_000_000);
+    assert.equal(createCount(f), 1);
+  } finally { f.close(); }
+});
+
+test('an incomplete opt-in, unhealthy roster or explicit opt-out leaves sales details untouched', async () => {
+  for (const gate of ['missing', 'unhealthy', 'off']) {
+    const f = fixture({ detailColumns: true, ...(gate === 'off' ? { salesDetails: false } : {}) });
+    try {
+      f.source.records.get('recSource1').fields['日期'] = 1_760_000_000_000;
+      if (gate === 'missing') f.salesA.schema = f.salesA.schema.filter(field => field.field_name !== '运营名字');
+      if (gate === 'unhealthy') f.hooks.staffUnhealthy = true;
+      f.hooks.auditDetailsTarget = () => assert.fail('A closed gate must not make an access request');
+      const assignment = await f.mirror.ensure({ id: 'recSource1' });
+      await f.mirror.sync();
+      assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
+    } finally { f.close(); }
+  }
+});
+
+test('sales details recheck ACL before each write and cache denied access for this target round', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    const source = f.source.records.get('recSource1');
+    source.fields['日期'] = 1_760_000_000_000;
+    for (const id of ['recSource1', 'recSource2', 'recSource3']) {
+      f.source.records.set(id, { ...clone(source), record_id: id });
+      await f.mirror.ensure({ id });
+    }
+    let audits = 0;
+    f.hooks.auditDetailsTarget = () => ++audits === 1;
+    assert.equal((await f.mirror.sync()).detailWrites, 1);
+    assert.equal(audits, 2);
+    assert.equal([...f.salesA.records.values()].filter(record => record.fields['日期']).length, 1);
   } finally { f.close(); }
 });
 

@@ -56,6 +56,7 @@ function safeStatus(engine) {
 }
 export async function createEngine(config, { root = ROOT, client = new WorkflowClient(config), Engine = WorkflowEngine, Mirror = SalesMirror, Roster=StaffRoster, Provisioner=StaffProvisioner, Admin=StaffAdminClient, Operator=OperatorMirror } = {}) {
   const engine = new Engine({ config, client, dbPath: path.resolve(root, config.dbPath), memberProvider: () => readConfig(root) });
+  let salesDetails = {};
   try {
     if(config.staffManagement?.enabled){
       const staff=new Roster({config,db:engine.db,client});
@@ -65,6 +66,31 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
         await engine.refreshMembers({persist:false});return staff.readCurrent(id);
       }});
       engine.staff=staff;
+      if (config.mirrors?.salesDetails !== false) {
+        salesDetails = {
+          operatorNames: () => {
+            if (!staff.healthy || engine.staffFailure) return null;
+            return new Map(staff.registry()
+              .filter(entry => entry.role === 'operator' && entry.ready === true && entry.state !== 'review')
+              .map(entry => [entry.openId, entry.displayName]));
+          },
+          auditDetailsTarget: async (member, budgetEnded) => {
+            if (!staff.healthy || engine.staffFailure || budgetEnded()) return false;
+            await engine.refreshMembers({ persist: false });
+            const current = engine.config.members.find(item => item.id === member.id && item.openId === member.openId);
+            if (current?.target?.appToken !== member.target.appToken || current.target.tableId !== member.target.tableId) return false;
+            const registered = staff.registry().find(item => item.id === member.id && item.openId === member.openId);
+            if (registered?.role !== 'sales' || registered.ready !== true || registered.retired ||
+                !registered.recordId || !['ready', 'paused', 'disabled'].includes(registered.state)) return false;
+            if (budgetEnded()) return false;
+            if (!staff.provisioner.privateSharing(await admin.getSharing(member.target.appToken))) return false;
+            if (budgetEnded()) return false;
+            const collaborators = await admin.listMembers(member.target.appToken);
+            staff.provisioner.members(member, collaborators, { existing: true, requireAll: true });
+            return collaborators.some(entry => entry.isApp === true && entry.perm === 'full_access');
+          },
+        };
+      }
       engine.memberProvider=()=>{
         const fresh=readConfig(root),effective=staff.configForMembers();
         return{...fresh,members:engine.staffFailure?effective.members.map(member=>({...member,enabled:false})):effective.members};
@@ -82,7 +108,7 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
       }
     }
     const clients = new Map([[config.appToken, client]]);
-    engine.mirror = new Mirror({ config: engine.config, db: engine.db, sourceClient: client,
+    engine.mirror = new Mirror({ config: engine.config, db: engine.db, sourceClient: client, ...salesDetails,
       clientFactory: appToken => {
         if (!clients.has(appToken)) clients.set(appToken, new WorkflowClient({ ...engine.config, appToken }));
         return clients.get(appToken);
