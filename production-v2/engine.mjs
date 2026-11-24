@@ -230,6 +230,7 @@ export class WorkflowEngine {
       if (receipt) snapshot.statusWritebackId = receipt.id;
       if (ownerChanged) {
         this.cancel(view.id, task => ['owner', 'contact'].includes(task.kind), 'OWNER_CHANGED');
+        delete snapshot.displayNextAttemptAt;
         if (!view.owner) { snapshot.autoEligible = false; snapshot.intent = null; snapshot.phase = 'owner_cleared'; this.review(view.id, 'OWNER_CLEARED'); }
         else { snapshot.displayPending = true; if (snapshot.intent && snapshot.intent.owner !== view.owner) snapshot.intent = null; }
       }
@@ -261,6 +262,19 @@ export class WorkflowEngine {
     this.inFlight = this.runScan(options).finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
+  syncDeferredSalesDetails(options = {}) {
+    if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
+    if (this.inFlight) return Promise.reject(new WorkflowError('ENGINE_BUSY'));
+    if (!this.config.enabled || !this.mirror?.syncDeferredDetails || options.shouldStop?.() || options.signal?.aborted) return Promise.resolve({});
+    this.inFlight = (async () => {
+      const result = await this.mirror.syncDeferredDetails(options);
+      const detail = Object.fromEntries(Object.entries(result || {}).filter(([key, value]) =>
+        key.startsWith('detail') && Number.isSafeInteger(value) && value >= 0));
+      if (Object.keys(detail).length) this.setMeta('mirror_status', { ...this.meta('mirror_status'), ...detail });
+      return detail;
+    })().finally(() => { this.inFlight = null; });
+    return this.inFlight;
+  }
   preview(view) {
     const old = this.get('v2_snapshots', view.id), actions = [];
     if (old?.view.owner && !view.owner) actions.push('owner_cleared');
@@ -274,7 +288,7 @@ export class WorkflowEngine {
       : ready(view) && (!old || old.view.owner !== view.owner || old.view.addMethod !== view.addMethod || old.view.wx !== view.wx || old.view.operator !== view.operator))) actions.push('contact_notification');
     return { recordId: view.id, actions };
   }
-  async runScan({ apply = false, shouldStop = () => false } = {}) {
+  async runScan({ apply = false, shouldStop = () => false, deferSalesDetails = false } = {}) {
     if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
@@ -306,15 +320,17 @@ export class WorkflowEngine {
       await this.drain(shouldStop);
       if (this.mirror && !stopped(shouldStop)) {
         try {
-          const result = await this.mirror.sync({ shouldStop, sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
+          const result = await this.mirror.sync({ shouldStop, deferDetails: deferSalesDetails, sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
           this.setMeta('mirror_status', Object.fromEntries(Object.entries(result || {}).filter(([, value]) => Number.isSafeInteger(value) && value >= 0)));
           if (result?.sourceWrites > 0 || result?.ensured > 0) this.setMeta('mirror_rescan_needed', true);
+          if (result?.statusSources?.length && !stopped(shouldStop)) await this.notifyConfirmedMirrorStatuses(result.statusSources, shouldStop);
         } catch (error) { if (safeCode(error) !== 'MIRROR_STOP_REQUESTED') { this.review('', safeCode(error), 'mirror_sync'); errors.push({ code: safeCode(error) }); } }
       }
       if (this.operatorMirror && staffResult.healthy === true && sourceViews.length === records.length && !stopped(shouldStop)) {
         try {
           const operators = this.staff.operatorCandidates();
-          const result = await this.operatorMirror.sync(sourceViews, { operators, shouldStop });
+          const latestViews = new Map(this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => [snapshot.id, snapshot.view]));
+          const result = await this.operatorMirror.sync(sourceViews.map(view => latestViews.get(view.id) ?? view), { operators, shouldStop });
           const byPerson = new Map(operators.map(operator => [operator.openId, operator]));
           const urls = (result.readyUrls || []).flatMap(({ openId, url }) => byPerson.has(openId)
             ? [{ ...byPerson.get(openId), url }] : []);
@@ -360,7 +376,18 @@ export class WorkflowEngine {
       });
     }
     if (snapshot.intent && (!snapshot.intent.nextAttemptAt || snapshot.intent.nextAttemptAt <= this.now())) await this.commitAssignment(id, shouldStop);
-    else if (snapshot.view.owner && snapshot.displayPending) await this.commitDisplay(id, shouldStop);
+    else if (!snapshot.intent && snapshot.view.owner && snapshot.displayPending && (!snapshot.displayNextAttemptAt || snapshot.displayNextAttemptAt <= this.now())) {
+      try {
+        await this.commitDisplay(id, shouldStop);
+      } catch (error) {
+        if (missingSource(error)) { this.markMissing(id); return; }
+        const pendingDisplay = this.get('v2_snapshots', id);
+        if (pendingDisplay?.displayPending && pendingDisplay.view.owner === snapshot.view.owner && pendingDisplay.ownerVersion === snapshot.ownerVersion) {
+          this.put('v2_snapshots', { ...pendingDisplay, displayNextAttemptAt: this.now() + 60_000 });
+        }
+        throw error;
+      }
+    }
   }
   async commitAssignment(id, shouldStop) {
     let snapshot = this.get('v2_snapshots', id), intent = snapshot?.intent;
@@ -427,23 +454,52 @@ export class WorkflowEngine {
     snapshot = this.observe(current);
     if (current.owner !== member.openId || stopped(shouldStop)) return;
     await this.refreshMembers();
-    const latestMember = this.config.members.find(item => item.openId === current.owner);
-    if (!latestMember) { this.review(id, 'OWNER_NOT_CONFIGURED', String(snapshot.ownerVersion)); return; }
     const latestFields = await this.resolveSource();
     if (digest(latestFields) !== digest(resolved)) fail('SOURCE_SCHEMA_CHANGED_BEFORE_WRITE');
+    await this.refreshMembers();
     const final = recordView(await this.client.readRecord(this.config.tableIds.leads, id), latestFields);
     snapshot = this.observe(final);
     if (final.owner !== current.owner) return;
-    await this.refreshMembers();
+    const latestMember = this.config.members.find(item => item.openId === final.owner);
+    if (!latestMember) { this.review(id, 'OWNER_NOT_CONFIGURED', String(snapshot.ownerVersion)); return; }
     if (stopped(shouldStop)) return;
-    const desired = this.assignmentDisplay(latestMember), patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => current[key] !== value));
-    if (Object.keys(patch).length) await this.client.updateRecord(this.config.tableIds.leads, id, encodePatch(patch, resolved));
-    const confirmed = await this.readSource(id); snapshot = this.observe(confirmed);
-    if (confirmed.owner === current.owner && Object.entries(desired).every(([key, value]) => confirmed[key] === value)) this.put('v2_snapshots', { ...snapshot, displayPending: false });
+    const desired = this.assignmentDisplay(latestMember), patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => final[key] !== value));
+    if (Object.keys(patch).length) {
+      await this.client.updateRecord(this.config.tableIds.leads, id, encodePatch(patch, latestFields));
+      const confirmed = await this.readSource(id);
+      snapshot = this.observe(confirmed);
+      if (confirmed.owner !== final.owner) return;
+      if (Object.entries(desired).some(([key, value]) => confirmed[key] !== value)) fail('ASSIGNMENT_DISPLAY_UNCONFIRMED');
+    }
+    delete snapshot.displayNextAttemptAt;
+    this.transaction(() => {
+      this.put('v2_snapshots', { ...snapshot, displayPending: false });
+      this.resolveReview(id, 'ASSIGNMENT_DISPLAY_UNCONFIRMED');
+      for (const task of this.all('v2_outbox')) {
+        if (task.recordId === id && task.kind === 'owner' && task.state === 'pending' && task.attempts === 0 &&
+          task.errorCode === 'OWNER_RESULTS_PENDING' && this.taskCurrent(task, snapshot)) {
+          this.put('v2_outbox', { ...task, nextAttemptAt: 0 });
+        }
+      }
+    });
   }
-  async drain(shouldStop) {
+  async notifyConfirmedMirrorStatuses(statusSources, shouldStop) {
+    const confirmed = new Set();
+    for (const view of statusSources) {
+      if (stopped(shouldStop)) break;
+      const prior = this.get('v2_snapshots', view.id);
+      if (!prior || prior.deleted) continue;
+      const receipt = this.unseenStatusWriteback(view, prior);
+      if (!receipt || prior.view.owner !== receipt.owner || prior.view.wxStatus !== receipt.from ||
+        view.owner !== receipt.owner || view.wxStatus !== receipt.to) continue;
+      this.observe(view);
+      confirmed.add(view.id);
+    }
+    if (confirmed.size) await this.drain(shouldStop, task => task.kind === 'status' && confirmed.has(task.recordId));
+  }
+  async drain(shouldStop, select = () => true) {
     if (!this.config.notification.enabled) return;
-    const tasks = this.all('v2_outbox').filter(task => pending(task) && (!task.nextAttemptAt || task.nextAttemptAt <= this.now())).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id)).slice(0, 50);
+    const tasks = this.all('v2_outbox').filter(task => pending(task) && (!task.nextAttemptAt || task.nextAttemptAt <= this.now()) && select(task)).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id)).slice(0, 50);
     for (const task of tasks) { if (stopped(shouldStop)) break; await this.deliver(task.id, shouldStop); }
   }
   wait(task, state, code, retryMilliseconds = this.config.pollSeconds * 1000) {
@@ -480,7 +536,11 @@ export class WorkflowEngine {
         member = this.config.members.find(member => member.openId === view.owner);
         if (!member || !member.target) { this.wait(task, 'waiting_member', 'OWNER_NOT_CONFIGURED'); this.review(view.id, 'OWNER_NOT_CONFIGURED', String(snapshot.ownerVersion)); return; }
         this.resolveReview(view.id, 'OWNER_NOT_CONFIGURED');
-        if (snapshot.intent || task.kind === 'owner' && snapshot.displayPending) { this.wait(task, 'pending', 'OWNER_RESULTS_PENDING', 4000); return; }
+        if (snapshot.intent || task.kind === 'owner' && snapshot.displayPending) {
+          const resultsRetryAt = snapshot.intent?.nextAttemptAt || snapshot.displayNextAttemptAt || 0;
+          this.wait(task, 'pending', 'OWNER_RESULTS_PENDING', Math.max(4000, resultsRetryAt - this.now()));
+          return;
+        }
       }
       if (task.kind === 'owner') {
         if (!this.mirror) { this.wait(task, 'waiting_mirror', 'MIRROR_NOT_CONFIGURED'); return; }
@@ -536,7 +596,11 @@ export class WorkflowEngine {
     if(Number.isSafeInteger(staffRetry)&&staffRetry>0)due.push(staffRetry);
     const operatorRetry = this.meta('operator_mirror_status')?.nextRetryAt;
     if (Number.isSafeInteger(operatorRetry) && operatorRetry > 0) due.push(operatorRetry);
-    for (const snapshot of this.all('v2_snapshots')) if (snapshot.intent && !snapshot.deleted && !snapshot.blocked && ready(snapshot.view) && ['assigning', 'assigned'].includes(snapshot.phase)) due.push(snapshot.intent.nextAttemptAt || this.now());
+    for (const snapshot of this.all('v2_snapshots')) {
+      if (snapshot.deleted) continue;
+      if (snapshot.intent && !snapshot.blocked && ready(snapshot.view) && ['assigning', 'assigned'].includes(snapshot.phase)) due.push(snapshot.intent.nextAttemptAt || this.now());
+      if (!snapshot.intent && snapshot.displayPending && snapshot.displayNextAttemptAt > 0 && this.config.members.some(member => member.openId === snapshot.view.owner)) due.push(snapshot.displayNextAttemptAt);
+    }
     for (const task of this.all('v2_outbox')) if (pending(task)) due.push(task.nextAttemptAt || this.now());
     return due.length ? Math.min(...due) : null;
   }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,6 +9,7 @@ import { workflowConfig } from './test-fixtures.mjs';
 import { WorkflowEvents } from './events.mjs';
 import { createBackup } from './backup.mjs';
 import { restore } from './restore.mjs';
+import { requestStop } from '../production/control.mjs';
 
 test('v2 rejects disabled or wrong-host activation before engine, network, or lock', async()=>{
   const root=mkdtempSync(path.join(tmpdir(),'shiyeji-v2-guard-'));let calls=0;
@@ -53,6 +54,39 @@ test('feedback and pending events wake before the ten-minute compensation scan',
   assert.equal(nextScanTime({now:1000,pollSeconds:600,nextRetryAt:500}),2000);
   assert.equal(nextScanTime({now:1000,pollSeconds:600}),601000);
   assert.equal(nextScanTime({now:1000,pollSeconds:600,hasError:true,nextRetryAt:2000}),61000);
+});
+test('the runner preempts only deferred work when a core event arrives', { timeout: 5000 }, async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-v2-idle-fixture-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(path.join(root, 'config.workflow.local.json'), '{}');
+  let eventHandler, scans = 0;
+  const calls = [];
+  class FakeEvents {
+    status() { return { state: eventHandler ? 'connected' : 'idle' }; }
+    async start(handler) { eventHandler = handler; }
+    async stop() {}
+  }
+  const engine = {
+    status: () => ({ initialized: true }),
+    async scan(options) {
+      assert.equal(options.deferSalesDetails, true);
+      calls.push('core scan');
+      if (++scans === 2) requestStop(root);
+      return { ok: true };
+    },
+    async acceptEvent() { calls.push('core event'); },
+    async syncDeferredSalesDetails({ signal }) {
+      calls.push('idle slice');
+      await eventHandler({ id: 'fixture-event' });
+      assert.equal(signal.aborted, true);
+      calls.push('idle cancelled');
+      return { detailPreempted: 1, detailPending: 2 };
+    },
+    async close() { calls.push('closed'); },
+  };
+  await run({ enabled: true, notification: { enabled: true }, allowedHost: 'OFFLINE-FIXTURE', pollSeconds: 600 },
+    { root, host: 'OFFLINE-FIXTURE', client: {}, Events: FakeEvents, makeEngine: async () => engine });
+  assert.deepEqual(calls, ['core scan', 'idle slice', 'core event', 'idle cancelled', 'core scan', 'closed']);
 });
 function fakeSdk(){
   const captured={closes:0,handlers:{}};

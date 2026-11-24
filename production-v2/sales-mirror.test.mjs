@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
-import { SalesMirror } from './sales-mirror.mjs';
+import { SalesMirror, boundedSalesDetailClient } from './sales-mirror.mjs';
 import { resolveFields, recordView } from './field-map.mjs';
+import { WorkflowClient } from './client.mjs';
 
 const clone = value => structuredClone(value);
 const sourceToken = 'SourceFixtureBase012345';
@@ -51,7 +53,7 @@ class FakeClient {
   }
 }
 
-function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails } = {}) {
+function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails, detailBudgetMs } = {}) {
   const log = [], source = new FakeClient(sourceToken, 'tblSourceFixture001', schema('Source'), log);
   const childSchema = schema('Child').filter(field => !['owner', 'operator'].includes(field.key));
   const salesA = new FakeClient('SalesAFixtureBase012345', 'tblSalesAFixture001', childSchema, log);
@@ -79,9 +81,9 @@ function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailC
     const record = await source.readRecord(source.table, id); return recordView(record, await resolveSource());
   };
   const db = new DatabaseSync(filename), clients = new Map([source, salesA, salesB].map(client => [client.base, client]));
-  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource,
+  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource, detailBudgetMs,
     operatorNames: () => hooks.staffUnhealthy ? null : new Map([['ou_fixture_operator', '离线运营']]),
-    auditDetailsTarget: async member => hooks.auditDetailsTarget?.(member) ?? true });
+    auditDetailsTarget: async (member, stopped, signal) => hooks.auditDetailsTarget?.(member, stopped, signal) ?? true });
   const mirror = construct();
   return { db, mirror, construct, config, source, salesA, salesB, log, hooks, readSource, resolveSource, close() { db.close(); } };
 }
@@ -203,7 +205,7 @@ test('an incomplete opt-in, unhealthy roster or explicit opt-out leaves sales de
   }
 });
 
-test('sales details recheck ACL before each write and cache denied access for this target round', async () => {
+test('deferred sales details attempt one row per slice and recheck the whitelist for each write', async () => {
   const f = fixture({ detailColumns: true });
   try {
     const source = f.source.records.get('recSource1');
@@ -214,9 +216,111 @@ test('sales details recheck ACL before each write and cache denied access for th
     }
     let audits = 0;
     f.hooks.auditDetailsTarget = () => ++audits === 1;
-    assert.equal((await f.mirror.sync()).detailWrites, 1);
+    const core = await f.mirror.sync({ deferDetails: true });
+    assert.equal(core.unchanged, 3);
+    assert.equal(audits, 0);
+    const first = await f.mirror.syncDeferredDetails();
+    assert.equal(first.detailWrites, 1);
+    assert.equal(first.detailAttempts, 1);
+    assert.equal(first.detailPending, 2);
+    const denied = await f.mirror.syncDeferredDetails();
+    assert.equal(denied.detailWrites, 0);
+    assert.equal(denied.detailPending, 1);
     assert.equal(audits, 2);
     assert.equal([...f.salesA.records.values()].filter(record => record.fields['日期']).length, 1);
+  } finally { f.close(); }
+});
+
+test('a comparatively slow source record finishes in the deferred slice after ordinary work returns', async () => {
+  const f = fixture({ detailColumns: true, detailBudgetMs: 750 });
+  try {
+    const source = f.source.records.get('recSource1');
+    source.fields['日期'] = 1_760_000_000_000;
+    const assignment = await f.mirror.ensure({ id: source.record_id });
+    let entered = false;
+    f.source.hooks.beforeRead = async () => { entered = true; await delay(65); };
+    f.salesA.hooks.beforeRead = async () => { await delay(20); };
+    f.hooks.auditDetailsTarget = async () => { await delay(15); return true; };
+    const core = await f.mirror.sync({ deferDetails: true });
+    assert.equal(core.unchanged, 1);
+    assert.equal(entered, false);
+    const result = await f.mirror.syncDeferredDetails();
+    assert.equal(entered, true);
+    assert.equal(result.detailTimeouts, 0);
+    assert.equal(result.detailWrites, 1);
+    assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], source.fields['日期']);
+  } finally { f.close(); }
+});
+
+test('an incoming event preempts deferred sales work, while a hard deadline reports its own cause', async () => {
+  for (const behavior of ['wake', 'timeout']) {
+    const f = fixture({ detailColumns: true, detailBudgetMs: behavior === 'timeout' ? 65 : 1000 });
+    try {
+      const source = f.source.records.get('recSource1');
+      source.fields['日期'] = 1_760_000_000_000;
+      const assignment = await f.mirror.ensure({ id: source.record_id });
+      await f.mirror.sync({ deferDetails: true });
+      const controller = new AbortController();
+      f.hooks.auditDetailsTarget = async (_member, _stop, signal) => {
+        if (behavior === 'wake') controller.abort();
+        await delay(2000, null, { signal });
+        assert.fail('Deferred audit should have been interrupted');
+      };
+      const result = await f.mirror.syncDeferredDetails({ signal: controller.signal });
+      assert.equal(result.detailAttempts, 1);
+      assert.equal(result.detailPreempted, Number(behavior === 'wake'));
+      assert.equal(result.detailTimeouts, Number(behavior === 'timeout'));
+      assert.equal(result.detailWrites, 0);
+      assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
+    } finally { f.close(); }
+  }
+});
+
+test('optional sales transport aborts the in-flight request on its deadline', async () => {
+  let requestSignal;
+  const client = new WorkflowClient({}, { fetchImpl: async (_url, { signal }) => {
+    requestSignal = signal;
+    await delay(2000, null, { signal });
+    assert.fail('The request should be cancelled before its ordinary timeout');
+  } });
+  client.cachedToken = { value: 'fake-scalar-token', expiresAt: Date.now() + 60000 };
+  const deadline = AbortSignal.timeout(30);
+  const scoped = boundedSalesDetailClient(client, deadline);
+  await assert.rejects(scoped.api('/open-apis/bitable/v1/mock'), { code: 'NETWORK_OR_TIMEOUT' });
+  assert.equal(deadline.aborted, true);
+  assert.equal(requestSignal.aborted, true);
+});
+
+test('optional sales transport returns upon a Feishu rate limit without a retry or core behavior change', async () => {
+  let requests = 0, sleeps = 0;
+  const client = new WorkflowClient({}, { fetchImpl: async () => {
+    requests++;
+    return Response.json({ code: 99991400 }, { status: 429, headers: { 'retry-after': '5' } });
+  }, sleepImpl: async () => { sleeps++; } });
+  client.cachedToken = { value: 'fake-scalar-token', expiresAt: Date.now() + 60000 };
+  const scoped = boundedSalesDetailClient(client, new AbortController().signal);
+  await assert.rejects(scoped.api('/open-apis/bitable/v1/mock'), { code: 'SALES_DETAILS_RATE_LIMIT' });
+  assert.deepEqual([requests, sleeps], [1, 0]);
+  await assert.rejects(client.api('/open-apis/bitable/v1/mock'), { code: '99991400' });
+  assert.deepEqual([requests, sleeps], [5, 3]);
+});
+
+test('a rate-limited scalar attempt leaves both sales targets quiet for the rest of the scan', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    const first = f.source.records.get('recSource1');
+    first.fields['日期'] = 1_760_000_000_000;
+    const second = { ...clone(first), record_id: 'recSource2' };
+    second.fields.Owner = [{ id: f.config.members[1].openId }];
+    f.source.records.set(second.record_id, second);
+    await f.mirror.ensure({ id: first.record_id });
+    await f.mirror.ensure({ id: second.record_id });
+    let audits = 0;
+    f.hooks.auditDetailsTarget = () => { audits++; throw Object.assign(new Error('offline rate limit'), { code: 'SALES_DETAILS_RATE_LIMIT' }); };
+    const result = await f.mirror.sync();
+    assert.equal(result.unchanged, 2);
+    assert.equal(audits, 1);
+    assert.equal(result.detailWrites, 0);
   } finally { f.close(); }
 });
 

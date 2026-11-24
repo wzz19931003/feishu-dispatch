@@ -6,7 +6,7 @@ import { WorkflowClient } from './client.mjs';
 import { ROOT, KIND, ordinaryFile, acquireLock, writeSnapshot, stopRequested, safeCode, status, requestStop } from '../production/control.mjs';
 import { validateWorkflowConfig, resolveFields } from './field-map.mjs';
 import { WorkflowEngine } from './engine.mjs';
-import { SalesMirror } from './sales-mirror.mjs';
+import { SalesMirror, boundedSalesDetailClient, SALES_DETAIL_BUDGET_MS } from './sales-mirror.mjs';
 import { WorkflowEvents } from './events.mjs';
 import { WORKFLOW_RELEASE } from './version.mjs';
 import { StaffRoster, resolveStaffSchema } from './staff-roster.mjs';
@@ -74,7 +74,7 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
               .filter(entry => entry.role === 'operator' && entry.ready === true && entry.state !== 'review')
               .map(entry => [entry.openId, entry.displayName]));
           },
-          auditDetailsTarget: async (member, budgetEnded) => {
+          auditDetailsTarget: async (member, budgetEnded, deadline) => {
             if (!staff.healthy || engine.staffFailure || budgetEnded()) return false;
             await engine.refreshMembers({ persist: false });
             const current = engine.config.members.find(item => item.id === member.id && item.openId === member.openId);
@@ -83,9 +83,10 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
             if (registered?.role !== 'sales' || registered.ready !== true || registered.retired ||
                 !registered.recordId || !['ready', 'paused', 'disabled'].includes(registered.state)) return false;
             if (budgetEnded()) return false;
-            if (!staff.provisioner.privateSharing(await admin.getSharing(member.target.appToken))) return false;
+            const scopedAdmin = boundedSalesDetailClient(admin, deadline);
+            if (!staff.provisioner.privateSharing(await scopedAdmin.getSharing(member.target.appToken))) return false;
             if (budgetEnded()) return false;
-            const collaborators = await admin.listMembers(member.target.appToken);
+            const collaborators = await scopedAdmin.listMembers(member.target.appToken);
             staff.provisioner.members(member, collaborators, { existing: true, requireAll: true });
             return collaborators.some(entry => entry.isApp === true && entry.perm === 'full_access');
           },
@@ -132,8 +133,10 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
   assertActivation(config, host);
   const lease = acquireLock(root); // Reuse v1's lock: v1 and v2 cannot run together on this host.
   let engine, events, timer, watcher, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '';
-  const stop = () => { stopping = true; };
-  const shouldStop = () => { if (stopping) return true; try { if (stopRequested(lease)) stopping = true; } catch { stopping = true; } return stopping; };
+  let detailController = null, detailsAvailable = false, nextDetailsAt = 0;
+  const wake = () => { dirty = true; detailController?.abort(); };
+  const stop = () => { stopping = true; detailController?.abort(); };
+  const shouldStop = () => { if (stopping) return true; try { if (stopRequested(lease)) stop(); } catch { stop(); } return stopping; };
   const snapshot = () => writeSnapshot(root, { kind: KIND, runnerVersion: 2, runnerRelease: WORKFLOW_RELEASE, ...lease.lock, checkedAt: new Date().toISOString(), phase,
     connection: events?.status?.() || { state: 'polling' }, ...safeStatus(engine), lastErrorCode,
     nextScanAt: new Date(nextScan).toISOString(), enabled: true, notificationsEnabled: true });
@@ -145,26 +148,39 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
     events = new Events(engine.config || config);
     const configStamp=()=>{const value=statSync(path.join(root,'config.workflow.local.json'));return `${value.mtimeMs}/${value.size}`;};
     let previousConfigStamp=configStamp();
-    timer = setInterval(() => { try { snapshot(); } catch { stopping = true; } }, 5000);
-    watcher = setInterval(()=>{shouldStop();try{const current=configStamp();if(current!==previousConfigStamp){previousConfigStamp=current;dirty=true;}}catch{stopping=true;}},1000);
+    timer = setInterval(() => { try { snapshot(); } catch { stop(); } }, 5000);
+    watcher = setInterval(()=>{shouldStop();try{const current=configStamp();if(current!==previousConfigStamp){previousConfigStamp=current;wake();}}catch{stop();}},1000);
     while (!shouldStop()) {
       const state = events.status().state;
       if (config.events !== false && !['connected','connecting','reconnecting'].includes(state) && Date.now() >= retryEventsAt) {
         retryEventsAt = Date.now() + 60000;
-        try { await events.stop(); await events.start(async event => { await engine.acceptEvent?.(event); dirty = true; }); }
+        try { await events.stop(); await events.start(async event => { await engine.acceptEvent?.(event); wake(); }); }
         catch (error) { lastErrorCode = safeCode(error); }
       }
       if (shouldStop()) break;
       if (dirty || Date.now() >= nextScan) {
-        dirty = false; phase = 'scanning'; snapshot();
+        dirty = false; detailsAvailable = false; phase = 'scanning'; snapshot();
         try {
-          const result = await engine.scan({ apply: true, shouldStop });
+          const result = await engine.scan({ apply: true, shouldStop, deferSalesDetails: true });
+          detailsAvailable = result?.ok === true && !result.stopped && typeof engine.syncDeferredSalesDetails === 'function';
           lastErrorCode = result?.ok === false ? safeCode(result.errors?.[0]) : '';
           const retry = result?.nextRetryAt ?? engine.status().nextRetryAt;
           const staffOnly=engine.status().staff?.healthy===true&&result?.errors?.length>0&&result.errors.every(error=>safeCode(error).startsWith('STAFF_'));
           nextScan = nextScanTime({pollSeconds:config.pollSeconds||600,hasError:Boolean(lastErrorCode)&&!staffOnly,nextRetryAt:retry});
         } catch (error) { lastErrorCode = safeCode(error); nextScan = Date.now() + 60000; }
         phase = lastErrorCode ? 'scan_error' : 'polling'; snapshot();
+      }
+      if (detailsAvailable && !dirty && !shouldStop() && Date.now() >= nextDetailsAt && nextScan - Date.now() > SALES_DETAIL_BUDGET_MS) {
+        detailController = new AbortController();
+        try {
+          const detail = await engine.syncDeferredSalesDetails({ shouldStop, signal: detailController.signal });
+          detailsAvailable = (detail?.detailPending || 0) > 0;
+          nextDetailsAt = Date.now() + (detail?.detailRateLimited ? 30_000 : 2000);
+        } catch {
+          detailsAvailable = false;
+        } finally {
+          detailController = null;
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 1000));
     }

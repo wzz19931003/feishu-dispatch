@@ -302,22 +302,30 @@ export class OperatorMirror {
     this.resolve(row.id);
     return true;
   }
+  unchanged(copies, resource, fields, records, desired) {
+    if (copies.length !== 1) return false;
+    const [row] = copies;
+    const record = records.get(row.targetRecordId);
+    return row.state === 'active' && row.operatorId === resource.id && Boolean(record) &&
+      hash(row.values) === hash(desired) && hash(this.childValues(record, fields)) === hash(desired);
+  }
   async ensure(view, resource, operator, fields, records, shouldStop) {
     const active = this.liveCopies(view.id);
     for (const row of active) if (row.operatorId !== view.operator) {
-      if (this.writes >= this.maxWrites) { this.scan.pending++; return; }
+      if (this.writes >= this.maxWrites) { this.scan.revocationBacklog = 1; return; }
       if (!await this.revoke(row, shouldStop)) fail('OPERATOR_SOURCE_CHANGED');
       this.scan.revoked++;
     }
-    if (this.liveCopies(view.id).some(row => row.state === 'review')) fail('OPERATOR_COPY_REVIEW_REQUIRED');
-    if (this.writes >= this.maxWrites) { this.scan.pending++; return; }
-    let row = this.liveCopies(view.id).find(item => item.operatorId === resource.id);
+    const copies = this.liveCopies(view.id);
+    if (copies.some(row => row.state === 'review')) fail('OPERATOR_COPY_REVIEW_REQUIRED');
     let desired = this.values(view, fields);
-    const record = row?.targetRecordId ? records.get(row.targetRecordId) : null;
-    if (row?.state === 'active' && record && hash(row.values) === hash(desired) && hash(this.childValues(record, fields)) === hash(desired)) {
+    if (this.unchanged(copies, resource, fields, records, desired)) {
       this.scan.unchanged++;
       return;
     }
+    if (this.writes >= this.maxWrites) { this.scan.pending++; return; }
+    let row = copies.find(item => item.operatorId === resource.id);
+    const record = row?.targetRecordId ? records.get(row.targetRecordId) : null;
     const fresh = await this.source(view.id);
     if (!fresh || fresh.operator !== resource.id) fail('OPERATOR_SOURCE_CHANGED');
     desired = this.values(fresh, fields);
@@ -361,7 +369,9 @@ export class OperatorMirror {
       views.some(view => !rowId(view?.id) || view.operator && !personId(view.operator))) fail('OPERATOR_SOURCE_SNAPSHOT_INVALID');
     this.featureEnabled();
     this.active = this.validateOperators(operators);
-    this.scan = { sourceRecords: views.length, created: 0, updated: 0, revoked: 0, unchanged: 0, pending: 0, reviews: 0 };
+    // pending counts deferred copy processing. revocationBacklog is an indicator because
+    // cleanup can stop at the first stale row after using the entire quota.
+    this.scan = { sourceRecords: views.length, created: 0, updated: 0, revoked: 0, unchanged: 0, pending: 0, revocationBacklog: 0, reviews: 0 };
     this.writes = 0;
     this.busy = true;
     const readyUrls = [];
@@ -372,12 +382,18 @@ export class OperatorMirror {
         const view = byId.get(row.sourceId);
         if (row.state === 'revoked' || view?.operator === row.operatorId) continue;
         if (stop(shouldStop)) break;
-        if (this.writes >= this.maxWrites) { this.scan.pending++; break; }
+        if (this.writes >= this.maxWrites) { this.scan.revocationBacklog = 1; break; }
         try { if (await this.revoke(row, shouldStop)) this.scan.revoked++; }
         catch (error) { this.review(safe(error), row.sourceId, row.id); this.scan.reviews++; }
       }
-      for (const operator of this.active.values()) {
+      const staff = [...this.active.values()];
+      const next = this.db.prepare("SELECT value FROM v2_operator_meta WHERE key='next_operator'").get()?.value;
+      const start = staff.findIndex(operator => operator.openId === next);
+      const ordered = start > 0 ? [...staff.slice(start), ...staff.slice(0, start)] : staff;
+      let lastWriter, copiesAtLimit;
+      for (const operator of ordered) {
         if (stop(shouldStop)) break;
+        const beforeWrites = this.writes;
         try {
           const resource = await this.prepare(operator, shouldStop);
           const fields = await this.auditResource(resource);
@@ -385,19 +401,36 @@ export class OperatorMirror {
           const trusted = new Set(this.all('copies').filter(row => row.operatorId === resource.id).map(row => row.targetRecordId));
           for (const id of records.keys()) if (!trusted.has(id)) fail('OPERATOR_UNTRUSTED_CHILD_RECORD');
           for (const row of this.all('copies').filter(row => row.operatorId === resource.id && row.state === 'revoked' && records.has(row.targetRecordId))) {
-            if (this.writes >= this.maxWrites) { this.scan.pending++; break; }
+            if (this.writes >= this.maxWrites) { this.scan.revocationBacklog = 1; break; }
             if (await this.revoke(row, shouldStop)) { this.scan.revoked++; records.delete(row.targetRecordId); }
           }
           readyUrls.push({ openId: operator.openId, url: `${resource.target.baseUrl}?table=${resource.target.tableId}` });
           for (const view of views.filter(view => view.operator === operator.openId)) {
             if (stop(shouldStop)) break;
-            if (this.writes >= this.maxWrites) { this.scan.pending++; continue; }
-            try { await this.ensure(view, resource, operator, fields, records, shouldStop); }
-            catch (error) { this.review(safe(error), view.id, this.liveCopies(view.id)[0]?.id ?? ''); this.scan.reviews++; }
+            try {
+              if (this.writes < this.maxWrites) {
+                await this.ensure(view, resource, operator, fields, records, shouldStop);
+                continue;
+              }
+              // All subsequent record mutations are deferred. Group the settled local state once
+              // rather than re-reading the whole SQLite copy table for each untouched source.
+              copiesAtLimit ??= Map.groupBy(this.all('copies').filter(row => row.state !== 'revoked'), row => row.sourceId);
+              const copies = copiesAtLimit.get(view.id) ?? [];
+              if (copies.some(row => row.operatorId !== operator.openId)) this.scan.revocationBacklog = 1;
+              else if (copies.some(row => row.state === 'review')) this.scan.reviews++;
+              else if (this.unchanged(copies, resource, fields, records, this.values(view, fields))) this.scan.unchanged++;
+              else this.scan.pending++;
+            } catch (error) { this.review(safe(error), view.id, this.liveCopies(view.id)[0]?.id ?? ''); this.scan.reviews++; }
           }
         } catch (error) { this.review(safe(error), '', operator.openId); this.scan.reviews++; }
+        finally { if (this.writes > beforeWrites) lastWriter = operator; }
       }
-      const nextRetryAt = this.scan.pending || this.scan.reviews ? this.now() + 60_000 : null;
+      if (lastWriter) {
+        const following = staff[(staff.indexOf(lastWriter) + 1) % staff.length].openId;
+        this.db.prepare(`INSERT INTO v2_operator_meta(key,value) VALUES('next_operator',?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(following);
+      }
+      const nextRetryAt = this.scan.pending || this.scan.revocationBacklog || this.scan.reviews ? this.now() + 60_000 : null;
       this.lastStatus = { ...this.scan, ready: readyUrls.length, stopped: stop(shouldStop), nextRetryAt };
       return { ...this.lastStatus, readyUrls };
     } finally { this.busy = false; }

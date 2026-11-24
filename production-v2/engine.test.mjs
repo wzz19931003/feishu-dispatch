@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { WorkflowEngine } from './engine.mjs';
@@ -85,6 +85,82 @@ test('manual A-to-B-to-A changes notify each effective owner without writing the
   assert.deepEqual(client.sent.map(item => item.recipientOpenId), ['ou_offlineSalesB', 'ou_offlineSalesA']);
   assert.equal(client.writes.every(write => !Object.hasOwn(write.fields, '负责人')), true); assert.equal(engine.get('v2_snapshots', 'recLeadold').ownerVersion, 3);
 });
+test('manual results use the last read and never rewrite the owner', async t => {
+  const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { owner: 'ou_offlineSalesB', actualSlot: 2, actualSort: 20, salesName: '模拟销售B' });
+  const read = client.readRecord.bind(client);
+  let reads = 0;
+  client.readRecord = async (table, id) => {
+    if (++reads === 2) client.change(id, { actualSlot: null, actualSort: null, salesName: '' });
+    return read(table, id);
+  };
+  assert.equal((await engine.scan({ apply: true })).ok, true);
+  assert.deepEqual(client.writes, [{ id: 'recLeadold', fields: { 实际分配位: 2, 实际分配顺序: 20, 实际销售: '模拟销售B' } }]);
+  assert.equal(engine.get('v2_snapshots', 'recLeadold').displayPending, false);
+  assert.equal(client.sent.length, 1);
+});
+test('an unconfirmed manual result is retried without rewriting the owner or duplicating the message', async t => {
+  let time = Date.UTC(2026, 10, 24);
+  const { engine, client } = await fixture(t, { now: () => time, client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  client.change('recLeadold', { owner: 'ou_offlineSalesB' });
+  const update = client.updateRecord.bind(client);
+  let attempts = 0;
+  client.updateRecord = async (table, id, fields) => {
+    if (++attempts === 1) return clone(client.records.get(id));
+    return update(table, id, fields);
+  };
+  assert.deepEqual((await engine.scan({ apply: true })).errors, [{ code: 'ASSIGNMENT_DISPLAY_UNCONFIRMED' }]);
+  assert.equal(engine.get('v2_snapshots', 'recLeadold').displayNextAttemptAt, time + 60_000);
+  assert.equal(engine.all('v2_outbox')[0].nextAttemptAt, time + 60_000);
+  assert.equal(client.sent.length, 0);
+  await engine.scan({ apply: true });
+  assert.equal(attempts, 1);
+  time += 60_000;
+  await engine.scan({ apply: true });
+  await engine.scan({ apply: true });
+  assert.equal(attempts, 2);
+  assert.equal(client.sent.length, 1);
+  assert.equal(client.records.get('recLeadold').fields.负责人[0].id, 'ou_offlineSalesB');
+  assert.equal(engine.get('v2_snapshots', 'recLeadold').displayNextAttemptAt, undefined);
+});
+test('a retained pending owner task is released immediately when its manual results are already confirmed after restart', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'workflow-v2-pending-display-'));
+  const dbPath = path.join(directory, 'workflow.sqlite'), client = new Client(), now = () => Date.UTC(2026, 10, 24);
+  const config = configuration();
+  let engine = new WorkflowEngine({ config, client, dbPath, now });
+  t.after(async () => {
+    await engine.close();
+    rmSync(dbPath, { force: true });
+    rmSync(`${dbPath}-wal`, { force: true });
+    rmSync(`${dbPath}-shm`, { force: true });
+    rmdirSync(directory);
+  });
+  engine.mirror = new Mirror(engine);
+  await engine.initialize();
+  client.add(lead('manual', { owner: 'ou_offlineSalesB' }));
+  const update = client.updateRecord.bind(client);
+  client.updateRecord = async (...args) => {
+    await update(...args);
+    throw Object.assign(new Error('response lost after server write'), { code: 'NETWORK_OR_TIMEOUT' });
+  };
+  await engine.scan({ apply: true });
+  const task = engine.all('v2_outbox')[0];
+  assert.equal(task.errorCode, 'OWNER_RESULTS_PENDING');
+  assert.equal(task.attempts, 0);
+  // 2.2.2 persisted the pending marker without any per-record display retry time.
+  const stored = engine.get('v2_snapshots', 'recLeadmanual');
+  delete stored.displayNextAttemptAt;
+  engine.put('v2_snapshots', stored);
+  await engine.close();
+  engine = new WorkflowEngine({ config, client, dbPath, now });
+  engine.mirror = new Mirror(engine);
+  await engine.scan({ apply: true });
+  await engine.scan({ apply: true });
+  assert.equal(client.writes.length, 1);
+  assert.equal(client.sent.length, 1);
+  assert.equal(engine.all('v2_outbox').length, 1);
+  assert.equal(engine.get('v2_outbox', task.id).state, 'sent');
+});
 test('an explicitly assigned disabled member with a valid target can still receive the manual transfer', async t => {
   const config = configuration(); config.members[1].enabled = false;
   const { engine, client } = await fixture(t, { config, client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
@@ -113,6 +189,39 @@ test('status failures notify the current registered operator even without custom
   const { engine, client, mirror } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
   client.change('recLeadold', { wx: '' }); mirror.editSalesStatus('recLeadold', '未通过'); await engine.scan({ apply: true }); await engine.scan({ apply: true });
   assert.equal(client.sent.length, 1); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA'); assert.ok(client.sent[0].text.includes('未填写')); assert.equal(client.sent[0].url, '');
+});
+test('a status written back during sales synchronization notifies the operator in the same scan', async t => {
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
+  engine.staff = { async refresh() { return { ok: true }; }, status() { return { healthy: true }; }, operatorCandidates() { return []; }, async recordOperatorViewUrls() { return {}; } };
+  engine.operatorMirror = { async sync(views) {
+    assert.equal(views.find(view => view.id === 'recLeadold').wxStatus, '未通过');
+    assert.equal(client.sent.length, 1);
+    return { updated: 1 };
+  } };
+  mirror.sync = async () => {
+    mirror.sync = Mirror.prototype.sync.bind(mirror);
+    mirror.editSalesStatus('recLeadold', '未通过');
+    return { sourceWrites: 1, statusSources: [await engine.readSource('recLeadold')] };
+  };
+
+  await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1);
+  assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA');
+  assert.equal(client.sent[0].text.split('\n').at(-1), '微信状态：未通过');
+  assert.equal(engine.status().operatorMirror.updated, 1);
+  await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1);
+});
+test('a superseded or unacknowledged writeback does not send a status reminder', async t => {
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead('one', { owner: 'ou_offlineSalesA' }), lead('two', { owner: 'ou_offlineSalesA' })]) });
+  mirror.sync = async () => {
+    mirror.editSalesStatus('recLeadone', '未通过');
+    client.change('recLeadone', { wxStatus: '通过' });
+    client.change('recLeadtwo', { wxStatus: '号码错误' });
+    return { sourceWrites: 2, statusSources: await Promise.all(['recLeadone', 'recLeadtwo'].map(id => engine.readSource(id))) };
+  };
+  assert.equal((await engine.scan({ apply: true })).ok, true);
+  assert.equal(client.sent.length, 0);
 });
 test('passed status suppresses a notification and cancels obsolete failure reminders', async t => {
   const { engine, client, mirror } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA' })]) });
@@ -288,9 +397,10 @@ test('real engine and real SalesMirror integrate quiet legacy copy, child feedba
     const oldChild = children.get(config.members[0].target.appToken); oldChild.records.get(beforeTransfer.targetRecordId).fields.微信状态 = '未通过';
     const feedback = await engine.scan({ apply: true });
     assert.equal(source.records.get('recLeadnew').fields.微信状态, '未通过'); assert.equal(feedback.needsRescan, true); assert.ok(feedback.nextRetryAt <= Date.now() + 1100);
-    assert.equal(source.sent.length, 1); // Feedback is observed by the explicitly requested next scan, not discarded as done.
+    assert.equal(source.sent.length, 2); // Confirmed feedback delivers before the scan ends.
+    assert.equal(source.sent[1].recipientOpenId, 'ou_offlineOperatorA');
     await engine.close(); engine = attach(new WorkflowEngine({ config, client: source, dbPath }));
-    assert.equal(engine.meta('mirror_rescan_needed'), true); // A restart between feedback and observation must not swallow the event.
+    assert.equal(engine.meta('mirror_rescan_needed'), true); // The fallback scan remains scheduled across restarts.
     await engine.scan({ apply: true }); assert.equal(source.sent.length, 2); assert.equal(source.sent[1].recipientOpenId, 'ou_offlineOperatorA'); assert.ok(source.sent[1].text.includes('未通过'));
     for (const wxStatus of ['号码错误', '待添加', '未通过']) {
       source.change('recLeadnew', { wxStatus });
