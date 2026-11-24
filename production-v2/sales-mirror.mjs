@@ -11,6 +11,7 @@ const safeCode = error => /^[A-Z0-9_]{1,80}$/.test(String(error?.code || '')) ? 
 const absent = error => ['1254043', 'RECORD_NOT_FOUND', 'SOURCE_RECORD_NOT_FOUND', 'SOURCE_NOT_FOUND'].includes(String(error?.code || ''));
 const COPY_FIELDS = Object.freeze(['wx', 'needs', 'wxStatus', 'addMethod', 'partySize', 'salesName']);
 const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'addMethod', 'partySize']);
+const STATUS_WRITEBACK_UNCONFIRMED = 'MIRROR_STATUS_WRITEBACK_OUTCOME_UNKNOWN';
 const equal = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
 const targetIdentity = target => JSON.stringify([target.appToken, target.tableId]);
 const stopped = shouldStop => { try { return Boolean(shouldStop?.()); } catch { return true; } };
@@ -60,6 +61,10 @@ export class SalesMirror {
     return value;
   }
   latest(sourceId) { return this.rows().filter(row => row.sourceId === sourceId && row.state !== 'revoked').at(-1) || null; }
+  statusWriteback(sourceId) {
+    const row = this.db.prepare("SELECT json_extract(data,'$.statusWriteback') AS receipt FROM v2_mirrors WHERE source_id=? AND state='active' ORDER BY version DESC LIMIT 1").get(sourceId);
+    return row?.receipt ? JSON.parse(row.receipt) : null;
+  }
   review(code, sourceId = '', mirrorId = '', detail = {}) {
     const id = fingerprint([code, sourceId, mirrorId, detail.targetRecordId || '', detail.targetAppToken || '']);
     this.db.prepare('INSERT INTO v2_mirror_reviews(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(id, JSON.stringify({ id, code, sourceId, mirrorId, ...detail, state: 'open', at: iso() }));
@@ -67,7 +72,7 @@ export class SalesMirror {
   closeReviews(mirrorId) {
     for (const record of this.db.prepare('SELECT id,data FROM v2_mirror_reviews').all()) {
       const value = JSON.parse(record.data);
-      if (value.mirrorId === mirrorId && value.state === 'open') this.db.prepare('UPDATE v2_mirror_reviews SET data=? WHERE id=?').run(JSON.stringify({ ...value, state: 'closed', closedAt: iso() }), record.id);
+      if (value.mirrorId === mirrorId && value.state === 'open' && value.code !== STATUS_WRITEBACK_UNCONFIRMED) this.db.prepare('UPDATE v2_mirror_reviews SET data=? WHERE id=?').run(JSON.stringify({ ...value, state: 'closed', closedAt: iso() }), record.id);
     }
   }
   status() {
@@ -172,6 +177,11 @@ export class SalesMirror {
     const targetView = recordView(record, resolved);
     let fresh = await this.source(row.sourceId);
     if (!fresh || fresh.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+    if (row.statusWritebackIntent && fresh.wxStatus !== row.statusWritebackIntent.from) {
+      // A lost acknowledgement does not prove the personal table authored the current source value.
+      this.review(STATUS_WRITEBACK_UNCONFIRMED, row.sourceId, row.id);
+      row = this.put({ ...row, statusWritebackIntent: null });
+    }
     const sourceValues = this.values(fresh, resolved, member), inbound = {};
     for (const key of this.feedback) {
       if (!Object.hasOwn(row.baseValues, key) || !resolved[key] || !sourceResolved[key]) fail('MIRROR_FEEDBACK_BASELINE_MISSING');
@@ -194,10 +204,12 @@ export class SalesMirror {
       const patch = encodePatch(inbound, atSourceWrite);
       this.checkWrite(shouldStop);
       const attempts = (row.feedbackAttempts || 0) + 1;
-      row = this.put({ ...row, pendingFeedback: inbound, feedbackAttempts: attempts, feedbackNextAttemptAt: this.now() + Math.min(300_000, 2000 * 2 ** Math.min(attempts, 8)) });
+      const statusWritebackIntent = Object.hasOwn(inbound, 'wxStatus') ? { id: randomUUID(), owner: row.owner, from: final.wxStatus, to: inbound.wxStatus } : null;
+      row = this.put({ ...row, pendingFeedback: inbound, statusWritebackIntent, feedbackAttempts: attempts, feedbackNextAttemptAt: this.now() + Math.min(300_000, 2000 * 2 ** Math.min(attempts, 8)) });
       this.sourceMutationCount++;
       try { await this.sourceClient.updateRecord(this.config.tableIds.leads, row.sourceId, patch); }
       catch (error) { this.put({ ...row, feedbackBlocked: attempts >= 8, errorCode: safeCode(error) }); this.review(attempts >= 8 ? 'MIRROR_FEEDBACK_REVIEW_REQUIRED' : 'MIRROR_FEEDBACK_UPDATE_FAILED', row.sourceId, row.id); throw error; }
+      if (statusWritebackIntent) row = this.put({ ...row, statusWritebackIntent: null, statusWriteback: statusWritebackIntent });
       fresh = await this.source(row.sourceId);
       if (!fresh || fresh.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
       if (Object.entries(inbound).some(([key, value]) => !equal(fresh[key], value))) { this.review('MIRROR_FEEDBACK_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_FEEDBACK_UNCONFIRMED'); }
@@ -216,7 +228,7 @@ export class SalesMirror {
     }
     const after = await this.source(row.sourceId);
     if (!after || after.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
-    this.put({ ...row, state: 'active', baseValues: canonical, pendingFeedback: null, feedbackAttempts: 0, feedbackNextAttemptAt: 0, feedbackBlocked: false, errorCode: '' });
+    this.put({ ...row, state: 'active', baseValues: canonical, pendingFeedback: null, statusWritebackIntent: null, feedbackAttempts: 0, feedbackNextAttemptAt: 0, feedbackBlocked: false, errorCode: '' });
     this.closeReviews(row.id);
     return true;
   }

@@ -9,7 +9,8 @@ const object = value => value && typeof value === 'object' && !Array.isArray(val
 const textValue = value => value == null ? '' : Array.isArray(value) ? value.map(textValue).join('') : object(value) ? String(value.text ?? value.name ?? '') : String(value);
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 const personId = value => typeof value === 'string' && /^ou_[A-Za-z0-9_-]{5,}$/.test(value);
-const FIELD_TYPES = { owner: [11], operator: [11], wx: [1], needs: [1], wxStatus: [1, 3], addMethod: [1, 3], partySize: [1, 2], actualSlot: [2], actualSort: [2], salesName: [1] };
+export const EXTRA_SOURCE_FIELDS = { account: [1, 3], channel: [1, 3], leadSource: [1, 3], leadDate: [5] };
+const FIELD_TYPES = { owner: [11], operator: [11], wx: [1], needs: [1], wxStatus: [1, 3], addMethod: [1, 3], partySize: [1, 2], actualSlot: [2], actualSort: [2], salesName: [1], ...EXTRA_SOURCE_FIELDS };
 const REQUIRED_SOURCE = ['owner', 'operator', 'wx', 'needs', 'wxStatus', 'addMethod', 'actualSlot', 'actualSort', 'salesName'];
 const FEEDBACK = ['wxStatus', 'wx', 'needs', 'addMethod', 'partySize'];
 
@@ -72,7 +73,10 @@ export function validateWorkflowConfig(raw, { requireTargets = true } = {}) {
       if (['wx', 'needs', 'wxStatus', ...feedbackFields].some(key => !targetFields[key])) fail('TARGET_FIELDS_INCOMPLETE');
       target = { appToken: member.target.appToken, baseUrl: targetUrl, tableId: member.target.tableId, fields: targetFields };
     } else pendingTargets.push(member.id);
-    return { id: member.id, openId: member.openId, displayName: member.displayName.trim(), order: member.order, enabled: member.enabled, target };
+    const salesWechat = member.salesWechat ?? '';
+    if (typeof salesWechat !== 'string' || salesWechat.length > 80 || /[\u0000-\u001f\u007f]/.test(salesWechat)) fail('MEMBER_WECHAT_INVALID');
+    return { id: member.id, openId: member.openId, displayName: member.displayName.trim(), order: member.order, enabled: member.enabled, target,
+      ...(salesWechat.trim() ? { salesWechat: salesWechat.trim() } : {}) };
   });
   if (requireTargets && pendingTargets.length) fail('TARGETS_REQUIRED');
   const staffManagement=validateStaffManagement(raw.staffManagement,{sourceAppToken:raw.appToken});
@@ -118,7 +122,11 @@ export function recordView(record, resolved) {
     const value = Object.hasOwn(record.fields, spec.name) ? record.fields[spec.name] : undefined;
     if (['owner', 'operator'].includes(key)) view[key] = person(value);
     else if (spec.type === 2) { const normalized = textValue(value).trim(); if (!normalized) view[key] = null; else { const number = Number(normalized); if (!Number.isFinite(number)) fail('RECORD_NUMBER_INVALID'); view[key] = number; } }
-    else view[key] = textValue(value).trim();
+    else if (spec.type === 5) {
+      const date = value === undefined || value === null || value === '' ? null : Number(value);
+      if (date !== null && (!Number.isSafeInteger(date) || !Number.isFinite(new Date(date).getTime()))) fail('RECORD_DATE_INVALID');
+      view[key] = date;
+    } else view[key] = textValue(value).trim();
   }
   return view;
 }

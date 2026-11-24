@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { WorkflowClient } from './client.mjs';
-import { validateWorkflowConfig, resolveFields, recordView, encodePatch, chooseMember } from './field-map.mjs';
+import { EXTRA_SOURCE_FIELDS, validateWorkflowConfig, resolveFields, recordView, encodePatch, chooseMember } from './field-map.mjs';
 
 export class WorkflowError extends Error {
   constructor(code) { super(`工作流操作未完成（${code}）`); this.code = code; }
@@ -17,6 +17,7 @@ const pending = item => ['pending', 'waiting_details', 'waiting_member', 'waitin
 // Only an explicit missing record proves deletion. Missing fields/tables/access do not.
 const missingSource = error => ['SOURCE_NOT_FOUND', 'RECORD_NOT_FOUND', 'SOURCE_RECORD_NOT_FOUND', '1254043'].includes(String(error?.code || ''));
 const activeContact = view => view.addMethod === '客户主动加';
+const operatorNoticeStatuses = new Set(['未通过', '号码错误', '主动加未添加']);
 const ready = view => Boolean(view.wx?.trim() && view.needs?.trim());
 const enabledPool = config => [...config.members].filter(member => member.enabled).sort((a, b) => a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 const stableConfig = config => { const { members, pendingTargets, ...rest } = config; return digest(rest); };
@@ -56,14 +57,27 @@ export class WorkflowEngine {
       CREATE TABLE IF NOT EXISTS v2_reviews(id TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS v2_inbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);`);
     if(this.config.staffManagement?.enabled)this.db.exec('CREATE TABLE IF NOT EXISTS v2_staff_runtime_events(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
-    const binding = digest([this.config.appId, this.config.appToken, this.config.tableIds.leads, this.config.fields.leads]);
-    if (this.meta('binding') && this.meta('binding') !== binding) { this.db.close(); fail('DATABASE_BINDING_MISMATCH'); }
-    this.setMeta('binding', binding);
+    try { this.bindSource(); } catch (error) { this.db.close(); throw error; }
     for (const task of this.all('v2_outbox').filter(task => task.state === 'sending')) {
       this.put('v2_outbox', { ...task, state: 'review', errorCode: 'SEND_OUTCOME_UNKNOWN' });
       this.review(task.recordId, 'SEND_OUTCOME_UNKNOWN', task.id);
     }
   }
+  bindSource() {
+    const fields = this.config.fields.leads;
+    const core = Object.fromEntries(Object.entries(fields).filter(([key]) => !Object.hasOwn(EXTRA_SOURCE_FIELDS, key)));
+    const binding = digest([this.config.appId, this.config.appToken, this.config.tableIds.leads, core]);
+    const pins = this.meta('source_extension_pins') || {};
+    const additions = Object.fromEntries(Object.entries(fields)
+      .filter(([key]) => Object.hasOwn(EXTRA_SOURCE_FIELDS, key)).map(([key, value]) => [key, digest(value)]));
+    if ((this.meta('binding') && this.meta('binding') !== binding) ||
+      Object.entries(additions).some(([key, value]) => pins[key] && pins[key] !== value)) fail('DATABASE_BINDING_MISMATCH');
+    this.transaction(() => {
+      this.setMeta('binding', binding);
+      if (Object.keys(additions).length) this.setMeta('source_extension_pins', { ...pins, ...additions });
+    });
+  }
+  hasSalesWechat() { return Boolean(this.config.staffManagement?.fields?.salesWechat); }
   stamp() { return new Date(this.now()).toISOString(); }
   meta(key) { const row = this.db.prepare('SELECT value FROM v2_meta WHERE key=?').get(key); return row ? JSON.parse(row.value) : null; }
   setMeta(key, value) { this.db.prepare('INSERT INTO v2_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)); }
@@ -187,6 +201,10 @@ export class WorkflowEngine {
       else if (pending(task)) this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: reason });
     }
   }
+  unseenStatusWriteback(view, previous) {
+    const receipt = this.mirror?.statusWriteback?.(view.id);
+    return receipt?.id && receipt.id !== previous?.statusWritebackId ? receipt : null;
+  }
   observe(view, { baseline = false, phase } = {}) {
     return this.transaction(() => {
       const old = this.get('v2_snapshots', view.id), first = !old;
@@ -194,12 +212,22 @@ export class WorkflowEngine {
       const statusChanged = !first && old.view.wxStatus !== view.wxStatus;
       const addChanged = !first && old.view.addMethod !== view.addMethod;
       const operatorChanged = !first && old.view.operator !== view.operator;
+      const notifyStatus = operatorNoticeStatuses.has(view.wxStatus);
+      const receipt = baseline ? null : this.unseenStatusWriteback(view, old);
+      const pendingStatus = notifyStatus && operatorChanged && !statusChanged && this.all('v2_outbox')
+        .find(task => task.recordId === view.id && task.kind === 'status' && task.statusVersion === old.statusVersion && task.statusWritebackId && pending(task));
+      const confirmedStatus = notifyStatus && statusChanged && receipt && receipt.owner === view.owner && old.view.owner === view.owner &&
+        receipt.from === old.view.wxStatus && receipt.to === view.wxStatus;
+      const contactOnAssignment = this.hasSalesWechat();
+      const contactAwaitingOperator = contactOnAssignment && activeContact(view) && operatorChanged && !ownerChanged && this.all('v2_outbox')
+        .some(task => task.recordId === view.id && task.kind === 'contact' && task.ownerVersion === old.ownerVersion && pending(task) && !task.delivery);
       const wxChanged = !first && old.view.wx !== view.wx;
       const detailsChanged = !first && (wxChanged || old.view.needs !== view.needs);
       const snapshot = { ...(old || {}), id: view.id, view, ownerVersion: (old?.ownerVersion || 0) + (ownerChanged || first && view.owner ? 1 : 0),
         statusVersion: (old?.statusVersion || 0) + (statusChanged ? 1 : 0), addVersion: (old?.addVersion || 0) + (addChanged ? 1 : 0),
         operatorVersion: (old?.operatorVersion || 0) + (operatorChanged ? 1 : 0), wxVersion: (old?.wxVersion || 0) + (wxChanged ? 1 : 0),
         autoEligible: old?.autoEligible ?? !baseline, phase: phase || (view.owner ? 'assigned' : ready(view) ? 'awaiting_sales' : 'awaiting_details'), deleted: false };
+      if (receipt) snapshot.statusWritebackId = receipt.id;
       if (ownerChanged) {
         this.cancel(view.id, task => ['owner', 'contact'].includes(task.kind), 'OWNER_CHANGED');
         if (!view.owner) { snapshot.autoEligible = false; snapshot.intent = null; snapshot.phase = 'owner_cleared'; this.review(view.id, 'OWNER_CLEARED'); }
@@ -208,15 +236,16 @@ export class WorkflowEngine {
       if (first && view.owner && !baseline) snapshot.displayPending = true;
       if (statusChanged) this.cancel(view.id, task => task.kind === 'status', 'STATUS_CHANGED');
       if (operatorChanged) this.cancel(view.id, task => ['status', 'contact'].includes(task.kind), 'OPERATOR_CHANGED');
-      snapshot.contactSignature = activeContact(view) && view.owner && ready(view) ? digest([snapshot.ownerVersion, snapshot.addVersion, snapshot.wxVersion, snapshot.operatorVersion]) : '';
+      const carryContact = contactOnAssignment && !ownerChanged && !operatorChanged && !addChanged && old?.contactSignature;
+      snapshot.contactSignature = view.owner && activeContact(view) && (contactOnAssignment || ready(view))
+        ? carryContact || digest([snapshot.ownerVersion, snapshot.addVersion, snapshot.wxVersion, snapshot.operatorVersion]) : '';
       if (old?.contactSignature && old.contactSignature !== snapshot.contactSignature) this.cancel(view.id, task => task.kind === 'contact', 'CONTACT_CHANGED');
       if (old?.blocked && !view.owner) snapshot.phase = 'legacy_review';
       this.put('v2_snapshots', snapshot);
       if (!baseline) {
         if ((first && view.owner) || ownerChanged && view.owner) this.queue('owner', snapshot);
-        if (statusChanged && view.wxStatus && view.wxStatus !== '通过') this.queue('status', snapshot);
-        if (operatorChanged && !statusChanged && view.wxStatus && view.wxStatus !== '通过' && this.all('v2_outbox').some(task => task.recordId === view.id && task.kind === 'status' && task.state === 'cancelled' && task.statusVersion === snapshot.statusVersion)) this.queue('status', snapshot);
-        if (snapshot.contactSignature && (first || old.contactSignature !== snapshot.contactSignature)) this.queue('contact', snapshot);
+        if (confirmedStatus || pendingStatus) this.queue('status', snapshot, { statusWritebackId: confirmedStatus ? receipt.id : pendingStatus.statusWritebackId });
+        if (snapshot.contactSignature && (contactOnAssignment ? first || ownerChanged || addChanged || contactAwaitingOperator : first || old.contactSignature !== snapshot.contactSignature)) this.queue('contact', snapshot);
         if (detailsChanged || operatorChanged) for (const task of this.all('v2_outbox').filter(task => task.recordId === view.id && ['waiting_details', 'waiting_operator'].includes(task.state))) this.put('v2_outbox', { ...task, state: 'pending', nextAttemptAt: 0 });
       }
       return snapshot;
@@ -237,8 +266,12 @@ export class WorkflowEngine {
     if (old?.view.owner && !view.owner) actions.push('owner_cleared');
     else if (view.owner && (!old || old.view.owner !== view.owner)) actions.push('owner_changed');
     else if (!view.owner && (old?.autoEligible ?? !(this.meta('legacy_known_ids') || []).includes(view.id))) actions.push(ready(view) ? enabledPool(this.config).length ? 'assign' : 'awaiting_sales' : 'awaiting_details');
-    if (old && old.view.wxStatus !== view.wxStatus && view.wxStatus && view.wxStatus !== '通过') actions.push('status_notification');
-    if (activeContact(view) && view.owner && ready(view) && (!old || old.view.owner !== view.owner || old.view.addMethod !== view.addMethod || old.view.wx !== view.wx || old.view.operator !== view.operator)) actions.push('contact_notification');
+    const receipt = old && this.unseenStatusWriteback(view, old);
+    if (receipt && receipt.owner === view.owner && old.view.owner === view.owner && receipt.from === old.view.wxStatus &&
+      receipt.to === view.wxStatus && old.view.wxStatus !== view.wxStatus && operatorNoticeStatuses.has(view.wxStatus)) actions.push('status_notification');
+    if (view.owner && activeContact(view) && (this.hasSalesWechat()
+      ? !old || old.view.owner !== view.owner || old.view.addMethod !== view.addMethod
+      : ready(view) && (!old || old.view.owner !== view.owner || old.view.addMethod !== view.addMethod || old.view.wx !== view.wx || old.view.operator !== view.operator))) actions.push('contact_notification');
     return { recordId: view.id, actions };
   }
   async runScan({ apply = false, shouldStop = () => false } = {}) {
@@ -252,12 +285,12 @@ export class WorkflowEngine {
     const resolved = await this.resolveSource(), records = await listAll(this.client, this.config.tableIds.leads);
     // A rename during pagination must not turn an existing owner into an apparent blank.
     if (digest(resolved) !== digest(await this.resolveSource())) fail('SOURCE_SCHEMA_CHANGED_DURING_SCAN');
-    const plans = [], errors = [...(staffResult.errors||[])], present = new Set(records.map(record => record.record_id));
+    const plans = [], sourceViews = [], errors = [...(staffResult.errors||[])], present = new Set(records.map(record => record.record_id));
     const knownLegacy = new Set(this.meta('legacy_known_ids') || []);
     for (const record of records) {
       if (stopped(shouldStop)) break;
       try {
-        const view = recordView(record, resolved); plans.push(this.preview(view));
+        const view = recordView(record, resolved); sourceViews.push(view); plans.push(this.preview(view));
         if (!apply) continue;
         const old = this.get('v2_snapshots', view.id);
         this.observe(view, { baseline: !old && knownLegacy.has(view.id) });
@@ -278,6 +311,23 @@ export class WorkflowEngine {
           if (result?.sourceWrites > 0 || result?.ensured > 0) this.setMeta('mirror_rescan_needed', true);
         } catch (error) { if (safeCode(error) !== 'MIRROR_STOP_REQUESTED') { this.review('', safeCode(error), 'mirror_sync'); errors.push({ code: safeCode(error) }); } }
       }
+      if (this.operatorMirror && staffResult.healthy === true && sourceViews.length === records.length && !stopped(shouldStop)) {
+        try {
+          const operators = this.staff.operatorCandidates();
+          const result = await this.operatorMirror.sync(sourceViews, { operators, shouldStop });
+          const byPerson = new Map(operators.map(operator => [operator.openId, operator]));
+          const urls = (result.readyUrls || []).flatMap(({ openId, url }) => byPerson.has(openId)
+            ? [{ ...byPerson.get(openId), url }] : []);
+          const links = await this.staff.recordOperatorViewUrls(urls, { shouldStop });
+          errors.push(...(links.errors || []).map(error => ({ code: safeCode(error) })));
+          this.setMeta('operator_mirror_status', Object.fromEntries(Object.entries(result).filter(([, value]) => Number.isSafeInteger(value) && value >= 0)));
+        } catch (error) {
+          if (!stopped(shouldStop)) {
+            this.review('', safeCode(error), 'operator_mirror_sync');
+            errors.push({ code: safeCode(error) });
+          }
+        }
+      }
       for (const id of acknowledgedEvents) { const event = this.get('v2_inbox', id); if (event?.state === 'pending') this.put('v2_inbox', { ...event, state: 'done', processedAt: this.stamp() }); }
       if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
     }
@@ -290,6 +340,12 @@ export class WorkflowEngine {
   assignmentDisplay(member, intent = null) {
     const index = enabledPool(this.config).findIndex(candidate => candidate.id === member.id);
     return { actualSlot: intent ? intent.slot : index >= 0 ? index + 1 : null, actualSort: intent ? intent.order : member.order, salesName: intent ? intent.name : member.displayName };
+  }
+  waitForSales(snapshot, intent, errorCode = '') {
+    const canPickAgain = Boolean(this.config.staffManagement?.fields?.leaveStart) &&
+      !snapshot.view.owner && intent.writeStarted === false;
+    const waiting = { ...snapshot, phase: 'awaiting_sales', ...(errorCode ? { errorCode } : {}) };
+    this.put('v2_snapshots', canPickAgain ? { ...waiting, intent: null } : waiting);
   }
   async processRecord(id, shouldStop) {
     let snapshot = this.get('v2_snapshots', id);
@@ -316,7 +372,7 @@ export class WorkflowEngine {
       if (!ready(view)) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_details' }); return; }
       await this.refreshMembers();
       let member = this.config.members.find(member => member.id === intent.memberId && member.openId === intent.owner);
-      if (!member || !member.enabled && !view.owner) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_sales' }); return; }
+      if (!member || !member.enabled && !view.owner) { this.waitForSales(snapshot, intent); return; }
       const resolved = await this.resolveSource(), raw = await this.client.readRecord(this.config.tableIds.leads, id); let current = recordView(raw, resolved);
       snapshot = this.observe(current);
       if (stopped(shouldStop)) return;
@@ -324,7 +380,7 @@ export class WorkflowEngine {
       if (!ready(current)) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_details' }); return; }
       await this.refreshMembers();
       member = this.config.members.find(member => member.id === intent.memberId && member.openId === intent.owner);
-      if (!member || !member.enabled && !current.owner) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_sales' }); return; }
+      if (!member || !member.enabled && !current.owner) { this.waitForSales(snapshot, intent); return; }
       const latestFields = await this.resolveSource();
       if (digest(latestFields) !== digest(resolved)) fail('SOURCE_SCHEMA_CHANGED_BEFORE_WRITE');
       // An employee-table request may await the network. It must precede the
@@ -332,7 +388,7 @@ export class WorkflowEngine {
       if(!current.owner&&this.staff){
         let permitted=false;
         try{permitted=!this.staffFailure&&await this.staff.verifyCandidate(member);}catch(error){this.review(id,safeCode(error),'staff_candidate');}
-        if(!permitted){this.put('v2_snapshots',{...snapshot,phase:'awaiting_sales',errorCode:'STAFF_CANDIDATE_NOT_READY'});return;}
+        if(!permitted){this.waitForSales(snapshot, intent, 'STAFF_CANDIDATE_NOT_READY');return;}
         if(digest(await this.resolveSource())!==digest(latestFields))fail('SOURCE_SCHEMA_CHANGED_DURING_STAFF_CHECK');
       }
       current = recordView(await this.client.readRecord(this.config.tableIds.leads, id), latestFields); snapshot = this.observe(current);
@@ -340,7 +396,7 @@ export class WorkflowEngine {
       if (!ready(current)) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_details' }); return; }
       await this.refreshMembers();
       member = this.config.members.find(member => member.id === intent.memberId && member.openId === intent.owner);
-      if (!member || !member.enabled && !current.owner) { this.put('v2_snapshots', { ...snapshot, phase: 'awaiting_sales' }); return; }
+      if (!member || !member.enabled && !current.owner) { this.waitForSales(snapshot, intent); return; }
       if (stopped(shouldStop)) return;
       const display = this.assignmentDisplay(member, intent);
       const logical = { ...(!current.owner ? { owner: intent.owner } : {}), ...Object.fromEntries(Object.entries(display).filter(([key, value]) => current[key] !== value)) };
@@ -396,8 +452,8 @@ export class WorkflowEngine {
   taskCurrent(task, snapshot) {
     if (!snapshot || snapshot.deleted) return false;
     if (task.kind === 'owner') return Boolean(snapshot.view.owner && snapshot.view.owner === task.owner && snapshot.ownerVersion === task.ownerVersion);
-    if (task.kind === 'status') return snapshot.statusVersion === task.statusVersion && Boolean(snapshot.view.wxStatus && snapshot.view.wxStatus !== '通过');
-    return Boolean(snapshot.contactSignature && snapshot.contactSignature === task.contactSignature && snapshot.view.owner === task.owner);
+    if (task.kind === 'status') return Boolean(task.statusWritebackId && snapshot.statusVersion === task.statusVersion && operatorNoticeStatuses.has(snapshot.view.wxStatus));
+    return Boolean(activeContact(snapshot.view) && snapshot.contactSignature && snapshot.contactSignature === task.contactSignature && snapshot.view.owner === task.owner);
   }
   validMirrorURL(result, member) {
     if (!result?.url || !result.targetRecordId || !member?.target) return false;
@@ -409,10 +465,15 @@ export class WorkflowEngine {
   async deliver(id, shouldStop) {
     let task = this.get('v2_outbox', id);
     if (!task || !pending(task) || stopped(shouldStop)) return;
-    let snapshot, view, member, url = '';
+    let snapshot, view, member;
     try {
       view = await this.readSource(task.recordId); snapshot = this.observe(view); task = this.get('v2_outbox', id);
-      if (!task || !pending(task) || !this.taskCurrent(task, snapshot)) { if (task && pending(task)) this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: 'EVENT_SUPERSEDED' }); return; }
+      if (!task || !pending(task)) return;
+      if (!this.taskCurrent(task, snapshot)) {
+        const reason = task.kind === 'status' && !task.statusWritebackId ? 'STATUS_ORIGIN_UNVERIFIED' : 'EVENT_SUPERSEDED';
+        this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: reason });
+        return;
+      }
       await this.refreshMembers();
       if (task.kind === 'owner' || task.kind === 'contact') {
         if (!ready(view)) { this.wait(task, 'waiting_details', 'DETAILS_REQUIRED'); return; }
@@ -426,7 +487,6 @@ export class WorkflowEngine {
         if (stopped(shouldStop)) return;
         const target = await this.mirror.ensure(view, { shouldStop });
         if (!this.validMirrorURL(target, member)) fail('MIRROR_URL_INVALID');
-        url = target.url;
         view = await this.readSource(task.recordId); snapshot = this.observe(view); task = this.get('v2_outbox', id);
         if (!task || !pending(task) || !this.taskCurrent(task, snapshot) || !ready(view)) return;
         await this.refreshMembers();
@@ -436,8 +496,12 @@ export class WorkflowEngine {
       const recipient = task.kind === 'owner' ? view.owner : view.operator;
       if (!recipient) { this.wait(task, 'waiting_operator', 'OPERATOR_REQUIRED'); return; }
       if (stopped(shouldStop)) return;
-      const draft = task.kind === 'owner' ? { recipientOpenId: recipient, title: this.config.notification.title, text: `您有一条${task.ownerVersion > 1 ? '转派' : '新'}客资，请及时跟进。\n客户微信号：${view.wx}\n客户需求：${view.needs}`, url }
+      if (task.kind === 'contact' && this.hasSalesWechat() && !task.delivery && !member.salesWechat) {
+        this.wait(task, 'waiting_member', 'SALES_WECHAT_REQUIRED'); return;
+      }
+      const draft = task.kind === 'owner' ? { recipientOpenId: recipient, title: this.config.notification.title, text: `您有一条${task.ownerVersion > 1 ? '转派' : '新'}客资，请及时跟进。\n客户微信号：${view.wx}\n客户需求：${view.needs}\n添加方式：${view.addMethod || '未填写'}\n所属账号：${view.account || '未填写'}`, url: '' }
         : task.kind === 'status' ? { recipientOpenId: recipient, title: '客资微信状态有变化', text: `客户微信号：${view.wx || '未填写'}\n微信状态：${view.wxStatus}`, url: '' }
+        : this.hasSalesWechat() ? { recipientOpenId: recipient, title: '客资已分配', text: `客资已分配给销售【${member.displayName}】\n请复制他的微信号，发给客户：【${member.salesWechat || ''}】`, url: '' }
         : { recipientOpenId: recipient, title: '客户主动添加销售', text: `实际销售：${member.displayName}\n客户微信号：${view.wx}`, url: '' };
       if (task.delivery && task.delivery.recipientOpenId !== draft.recipientOpenId) { this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: 'RECIPIENT_CHANGED' }); return; }
       const firstAttemptAt = task.firstAttemptAt || this.now();
@@ -470,6 +534,8 @@ export class WorkflowEngine {
     if (Number.isSafeInteger(mirrorRetry) && mirrorRetry > 0) due.push(mirrorRetry);
     const staffRetry=this.staff?.status?.()?.nextRetryAt;
     if(Number.isSafeInteger(staffRetry)&&staffRetry>0)due.push(staffRetry);
+    const operatorRetry = this.meta('operator_mirror_status')?.nextRetryAt;
+    if (Number.isSafeInteger(operatorRetry) && operatorRetry > 0) due.push(operatorRetry);
     for (const snapshot of this.all('v2_snapshots')) if (snapshot.intent && !snapshot.deleted && !snapshot.blocked && ready(snapshot.view) && ['assigning', 'assigned'].includes(snapshot.phase)) due.push(snapshot.intent.nextAttemptAt || this.now());
     for (const task of this.all('v2_outbox')) if (pending(task)) due.push(task.nextAttemptAt || this.now());
     return due.length ? Math.min(...due) : null;
@@ -481,7 +547,8 @@ export class WorkflowEngine {
     return { initialized: Boolean(this.meta('initialized')), busy: Boolean(this.inFlight), records, notifications, counts: { ...Object.fromEntries(Object.entries(records).map(([key, value]) => [`records_${key}`, value])), ...Object.fromEntries(Object.entries(notifications).map(([key, value]) => [`notifications_${key}`, value])) },
       reviews: this.all('v2_reviews').filter(review => review.state === 'open').length, eventsPending: this.all('v2_inbox').filter(event => event.state === 'pending').length,
       staffEventsPending:this.staffEvents().filter(event=>event.state==='pending').length,
-      nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: this.meta('mirror_status') || {},...(this.staff?{staff:this.staff.status()}:{} ) };
+      nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: this.meta('mirror_status') || {},
+      operatorMirror: this.meta('operator_mirror_status') || {}, ...(this.staff?{staff:this.staff.status()}:{} ) };
   }
   async close() { if (this.closed) return; try { if (this.inFlight) await this.inFlight; } finally { this.closed = true;try{await this.staff?.close?.();}finally{this.db.close();} } }
 }

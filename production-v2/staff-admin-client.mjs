@@ -2,6 +2,8 @@ import { WorkflowClient } from './client.mjs';
 import { resolveFields } from './field-map.mjs';
 
 export const STAFF_TARGET_NAMES = Object.freeze({ wx: '微信号', needs: '客户需求（天数/景点/预算等）', wxStatus: '微信状态', addMethod: '添加方式', partySize: '出游人数' });
+export const OPERATOR_TARGET_NAMES = Object.freeze({ ...STAFF_TARGET_NAMES, account: '平台账号名称', channel: '渠道',
+  leadSource: '客资来源（付费/自然流）', leadDate: '日期', salesName: '实际分配销售' });
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const baseId = value => typeof value === 'string' && /^[A-Za-z0-9]{10,100}$/.test(value);
 const personId = value => typeof value === 'string' && /^ou_[A-Za-z0-9_-]{5,}$/.test(value);
@@ -89,6 +91,39 @@ export class StaffAdminClient extends WorkflowClient {
       return { appToken, baseUrl: this.baseUrl(appToken), tableId: result.table_id,
         expectedOptions: Object.fromEntries(headers.filter(field => field.type === 3).map(field => [Object.keys(STAFF_TARGET_NAMES).find(key => STAFF_TARGET_NAMES[key] === field.field_name), field.property.options.map(option => option.name)])),
         fields: Object.fromEntries(Object.keys(STAFF_TARGET_NAMES).map((key, index) => [key, { fieldId: ids[index], types: [headers[index].type] }])) };
+    }, beforeMutation);
+  }
+  async createOperatorTable(appToken, { beforeMutation } = {}) {
+    this.employeeBase(appToken);
+    let headers;
+    const keys = Object.keys(OPERATOR_TARGET_NAMES).filter(key => this.config.fields?.leads?.[key]);
+    try {
+      if (['wx', 'needs', 'wxStatus', 'addMethod'].some(key => !keys.includes(key))) fail('OPERATOR_SOURCE_FIELDS_REQUIRED');
+      const source = await resolveFields(this, { appToken: this.config.appToken, tableId: this.config.tableIds.leads,
+        fields: Object.fromEntries(keys.map(key => [key, this.config.fields.leads[key]])) });
+      const accepted = { wx: [1], needs: [1], wxStatus: [3], addMethod: [1, 3], partySize: [1, 2],
+        account: [1, 3], channel: [1, 3], leadSource: [1, 3], leadDate: [5], salesName: [1] };
+      headers = keys.map(key => {
+        const field = source[key];
+        if (!accepted[key].includes(field.type)) fail('OPERATOR_SOURCE_FIELD_TYPE_INVALID');
+        const result = { field_name: OPERATOR_TARGET_NAMES[key], type: field.type };
+        if (field.type === 3) {
+          const options = field.property?.options;
+          if (!Array.isArray(options) || !options.length || options.some(option => typeof option?.name !== 'string' || !option.name.trim())
+            || new Set(options.map(option => option.name)).size !== options.length) fail('OPERATOR_SOURCE_OPTIONS_INVALID');
+          result.property = { options: options.map(option => ({ name: option.name, ...(Number.isInteger(option.color) ? { color: option.color } : {}) })) };
+        }
+        return result;
+      });
+    } catch (error) { throw beforeRequest(error); }
+    return this.mutation(async () => {
+      const result = await this.api(`/open-apis/bitable/v1/apps/${appToken}/tables`, { method: 'POST',
+        body: { table: { name: '运营客资', default_view_name: '我录入的客资', fields: headers } } });
+      const ids = result.field_id_list;
+      if (!/^tbl[A-Za-z0-9]{5,}$/.test(result.table_id ?? '') || !Array.isArray(ids) || ids.length !== keys.length ||
+        new Set(ids).size !== ids.length || ids.some(id => !/^fld[A-Za-z0-9]{5,}$/.test(id))) fail('OPERATOR_TABLE_RESPONSE_INVALID');
+      return { appToken, baseUrl: this.baseUrl(appToken), tableId: result.table_id,
+        fields: Object.fromEntries(keys.map((key, index) => [key, { fieldId: ids[index], types: [headers[index].type] }])) };
     }, beforeMutation);
   }
   async setPrivateSharing(appToken, { beforeMutation } = {}) {

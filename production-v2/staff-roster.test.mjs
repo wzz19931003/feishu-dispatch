@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { StaffRoster, resolveStaffSchema } from './staff-roster.mjs';
 import { workflowConfig, clone } from './test-fixtures.mjs';
+import { validateWorkflowConfig } from './field-map.mjs';
 
-const NAMES = { employee: '员工', role: '岗位', enabled: '启用', order: '派单顺序', notes: '备注', status: '开通状态', personalUrl: '个人表链接', updatedAt: '最近处理时间', error: '问题说明' };
+const NAMES = { employee: '员工', role: '岗位', enabled: '启用', order: '派单顺序', notes: '备注', status: '开通状态', personalUrl: '个人表链接', updatedAt: '最近处理时间', error: '问题说明', salesWechat: '销售对外微信', leaveStart: '休假开始', leaveEnd: '休假结束', operatorViewUrl: '本人客资只读入口' };
 const TYPES = { employee: 11, role: 3, enabled: 7, order: 2, notes: 1, status: 1, personalUrl: 1, updatedAt: 1, error: 1 };
-const config = ({ enabled = true } = {}) => ({ ...workflowConfig(), enabled, notification: { enabled }, staffManagement: { enabled: true, appToken: 'OfflineStaffBase12345', tableId: 'tblOfflineStaff12345',
-  fields: Object.fromEntries(Object.entries(TYPES).map(([key, type]) => [key, { fieldId: `fldOfflineStaff${key}`, types: [type], ...(key === 'employee' ? { multiple: false } : {}) }])),
+const EXTRA_TYPES = { salesWechat: 1, leaveStart: 5, leaveEnd: 5, operatorViewUrl: 1 };
+const config = ({ enabled = true, extraFields = false, operatorViews = false } = {}) => ({ ...workflowConfig(), enabled, notification: { enabled }, staffManagement: { enabled: true, appToken: 'OfflineStaffBase12345', tableId: 'tblOfflineStaff12345',
+  ...(operatorViews ? { operatorViews: { enabled: true } } : {}),
+  fields: Object.fromEntries(Object.entries({ ...TYPES, ...(extraFields ? EXTRA_TYPES : {}) }).map(([key, type]) => [key, { fieldId: `fldOfflineStaff${key}`, types: [type], ...(key === 'employee' ? { multiple: false } : {}) }])),
   fixedReaders: ['示例管理员甲', '示例销售乙', '示例销售甲', '示例管理员乙'].map((name, id) => ({ openId: `ou_offlineReader${id}`, displayName: name })), operatorFormUrl: 'https://offline.feishu.cn/share/base/form/shrOfflineForm12345', seedRecordIds: ['recStaffA', 'recStaffB'] } });
 const row = (id, patch = {}) => ({ record_id: `recStaff${id}`, fields: Object.fromEntries(Object.entries({ employee: [{ id: `ou_offlineSales${id}`, name: `Offline Sales ${id}` }], role: '销售', enabled: true, order: id === 'A' ? 1 : id === 'B' ? 2 : 3, notes: '', status: '', personalUrl: '', updatedAt: '', error: '', ...patch }).map(([key, value]) => [NAMES[key], value])) });
 const target = id => ({ appToken: `OfflineNewTarget${id}12345`, tableId: `tblOfflineNew${id}12345`, baseUrl: `https://offline.feishu.cn/base/OfflineNewTarget${id}12345`, fields: { wx: { fieldId: 'fldOfflineTargetWx', types: [1] }, needs: { fieldId: 'fldOfflineTargetNeeds', types: [1] }, wxStatus: { fieldId: 'fldOfflineTargetStatus', types: [3] } } });
@@ -15,7 +18,7 @@ const target = id => ({ appToken: `OfflineNewTarget${id}12345`, tableId: `tblOff
 class Client {
   constructor(cfg, rows) {
     this.cfg = cfg; this.rows = new Map(rows.map(value => [value.record_id, clone(value)])); this.writes = []; this.calls = []; this.pageSize = 100;
-    this.schema = Object.entries(cfg.staffManagement.fields).map(([key, value]) => ({ field_id: value.fieldId, field_name: NAMES[key], type: TYPES[key], ...(key === 'employee' ? { property: { multiple: false } } : {}) }));
+    this.schema = Object.entries(cfg.staffManagement.fields).map(([key, value]) => ({ field_id: value.fieldId, field_name: NAMES[key], type: TYPES[key] || EXTRA_TYPES[key], ...(key === 'employee' ? { property: { multiple: false } } : {}) }));
   }
   async api(url, options = {}) {
     this.calls.push({ url, method: options.method || 'GET' });
@@ -285,4 +288,145 @@ test('order normalization accepts safe positive decimal integers and rejects coe
     f.client.change('A', { order });
     await assert.rejects(f.roster.readCurrent('recStaffA'), { code: 'STAFF_ORDER_INVALID' });
   }
+});
+
+test('sales contact is read by stable field ID and remains available for paused and manually disabled sales', async t => {
+  const f = fixture(t, { config: config({ extraFields: true }), rows: [row('A', { salesWechat: '  offline-public-wechat  ' }), row('B')] });
+  await f.roster.refresh({ apply: true });
+  const version = (await f.roster.readCurrent('recStaffA')).version;
+  f.client.rename('salesWechat', '改名的对外微信');
+  f.client.rows.get('recStaffA').fields.改名的对外微信 = 'offline-updated-contact';
+  f.client.change('A', { enabled: false }); await f.roster.refresh({ apply: true });
+  assert.equal(byId(f.roster, 'sales_A').salesWechat, 'offline-updated-contact');
+  assert.equal(byId(f.roster, 'sales_A').enabled, false);
+  f.client.change('A', { enabled: true });
+  assert.equal((await f.roster.readCurrent('recStaffA')).version, version);
+  const old = fixture(t); await old.roster.refresh(); assert.equal(byId(old.roster, 'sales_A').salesWechat, '');
+});
+
+test('Shanghai inclusive leave dates pause at local midnight and automatically resume after the final day', async t => {
+  let tick = Date.parse('2026-11-18T15:59:59.999Z');
+  const f = fixture(t, { config: config({ extraFields: true }), now: () => tick,
+    rows: [row('A', { salesWechat: 'offline-public', leaveStart: '2026-11-19', leaveEnd: '2026-11-19' }), row('B')] });
+  const originalTarget = clone(f.cfg.members[0].target);
+  await f.roster.refresh({ apply: true }); const before = byId(f.roster, 'sales_A');
+  assert.equal(before.enabled, true); assert.equal(f.roster.status().nextRetryAt, Date.parse('2026-11-18T16:00:00Z'));
+  tick++; assert.equal(byId(f.roster, 'sales_A').enabled, false);
+  assert.equal(await f.roster.verifyCandidate(before), false);
+  await f.roster.refresh({ apply: true });
+  assert.equal(f.roster.status().counts.paused, 1); assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '休假中');
+  assert.equal(f.roster.status().nextRetryAt, Date.parse('2026-11-19T16:00:00Z'));
+  assert.equal(byId(f.roster, 'sales_A').salesWechat, 'offline-public');
+  tick = Date.parse('2026-11-19T15:59:59.999Z'); assert.equal(byId(f.roster, 'sales_A').enabled, false);
+  tick++; assert.equal(byId(f.roster, 'sales_A').enabled, true);
+  await f.roster.refresh({ apply: true });
+  assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '可用');
+  assert.deepEqual(byId(f.roster, 'sales_A').target, originalTarget);
+});
+
+test('manual disable takes precedence after leave ends and a new employee on leave is not provisioned', async t => {
+  let tick = Date.parse('2026-11-19T04:00:00Z');
+  const f = fixture(t, { config: config({ extraFields: true }), now: () => tick,
+    rows: [row('A', { enabled: false, leaveStart: '2026-11-19', leaveEnd: '2026-11-19' }), row('B'), row('C', { leaveStart: '2026-11-19', leaveEnd: '2026-11-19' })] });
+  await f.roster.refresh({ apply: true });
+  assert.equal(byId(f.roster, 'sales_A').enabled, false); assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '已停新单');
+  assert.equal(f.provisioner.calls.some(employee => employee.recordId === 'recStaffC'), false);
+  assert.equal(byId(f.roster, 'staff_recStaffC'), undefined);
+  tick = Date.parse('2026-11-19T16:00:00Z'); await f.roster.refresh({ apply: true });
+  assert.equal(byId(f.roster, 'sales_A').enabled, false); assert.equal(byId(f.roster, 'staff_recStaffC').enabled, true);
+  assert.equal(f.provisioner.calls.filter(employee => employee.recordId === 'recStaffC').length, 1);
+});
+
+test('date-typed millisecond values and decimal strings normalize to Shanghai calendar days without rebinding onboarding versions', async t => {
+  const f = fixture(t, { config: config({ extraFields: true }) });
+  const original = await f.roster.readCurrent('recStaffA');
+  const start = Date.parse('2026-11-18T16:00:00Z'), end = Date.parse('2026-11-19T16:00:00Z');
+  f.client.change('A', { leaveStart: start, leaveEnd: String(end), salesWechat: 'offline-updated' });
+  const updated = await f.roster.readCurrent('recStaffA');
+  assert.equal(updated.leaveStart, '2026-11-19'); assert.equal(updated.leaveEnd, '2026-11-20');
+  assert.equal(updated.version, original.version); assert.notEqual(updated.profileVersion, original.profileVersion);
+  f.client.change('A', { leaveStart: '2026-11-19', leaveEnd: '2026-11-20' });
+  assert.equal((await f.roster.readCurrent('recStaffA')).profileVersion, updated.profileVersion);
+});
+
+test('malformed or incomplete leave dates hold only that employee and preserve other eligible sales', async t => {
+  const f = fixture(t, { config: config({ extraFields: true }), now: () => Date.parse('2026-11-19T04:00:00Z') });
+  await f.roster.refresh({ apply: true }); const targetBefore = clone(byId(f.roster, 'sales_A').target);
+  const cases = [
+    { leaveStart: '2026-11-19', leaveEnd: '' }, { leaveStart: '', leaveEnd: '2026-11-19' },
+    { leaveStart: '2026-11-20', leaveEnd: '2026-11-19' }, { leaveStart: '2026-02-30', leaveEnd: '2026-11-19' },
+    { leaveStart: 'private-invalid-value', leaveEnd: '2026-11-19' }, { leaveStart: true, leaveEnd: '2026-11-19' },
+    { leaveStart: {}, leaveEnd: '2026-11-19' }, { leaveStart: Infinity, leaveEnd: '2026-11-19' },
+  ];
+  for (const patch of cases) {
+    f.client.change('A', patch); const result = await f.roster.refresh({ apply: true });
+    assert.equal(result.ok, false); assert.equal(f.roster.status().healthy, true);
+    assert.equal(f.roster.status().counts.review, 1); assert.equal(byId(f.roster, 'sales_A').enabled, false);
+    assert.equal(byId(f.roster, 'sales_B').enabled, true); assert.deepEqual(byId(f.roster, 'sales_A').target, targetBefore);
+    assert.equal(f.client.rows.get('recStaffA').fields.问题说明, 'STAFF_LEAVE_RANGE_INVALID');
+    assert.equal(JSON.stringify(result).includes('private-invalid-value'), false);
+  }
+  f.client.change('A', { leaveStart: '', leaveEnd: '' }); assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(byId(f.roster, 'sales_A').enabled, true);
+});
+
+test('new optional bindings append without changing the legacy binding or any existing target and history', async t => {
+  const f = fixture(t); await f.roster.refresh(); const original = f.roster.meta('binding');
+  f.db.exec('CREATE TABLE offline_history(value TEXT); INSERT INTO offline_history VALUES(\'keep-existing-delivery\');');
+  const upgraded = config({ extraFields: true }), client = new Client(upgraded, [row('A'), row('B')]);
+  const roster = new StaffRoster({ config: upgraded, db: f.db, client });
+  assert.equal(roster.meta('binding'), original); await roster.refresh();
+  assert.deepEqual(byId(roster, 'sales_A').target, f.cfg.members[0].target);
+  assert.equal(f.db.prepare('SELECT value FROM offline_history').get().value, 'keep-existing-delivery');
+  const changed = clone(upgraded); changed.staffManagement.fields.salesWechat.fieldId = 'fldOfflineReboundContact';
+  assert.throws(() => new StaffRoster({ config: changed, db: f.db, client }), { code: 'STAFF_OPTIONAL_FIELD_BINDING_CHANGED' });
+  const removed = clone(upgraded); delete removed.staffManagement.fields.leaveStart;
+  assert.throws(() => new StaffRoster({ config: removed, db: f.db, client }), { code: 'STAFF_OPTIONAL_FIELD_BINDING_CHANGED' });
+});
+
+test('operator candidates use validated local registry and URL results write only the dedicated output field', async t => {
+  const f = fixture(t, { config: config({ extraFields: true, operatorViews: true }),
+    rows: [row('A'), row('B'), row('Operator', { role: '运营', order: null })] });
+  await f.roster.refresh({ apply: true }); const reads = f.client.calls.length;
+  const operators = f.roster.operatorCandidates(); assert.equal(operators.length, 1); assert.equal(f.client.calls.length, reads);
+  const operator = operators[0], previousForm = f.client.rows.get(operator.recordId).fields.个人表链接;
+  f.client.writes.length = 0;
+  const url = 'https://offline.feishu.cn/base/OfflineOperatorView12345?table=tblOfflineOperator123';
+  assert.deepEqual(await f.roster.recordOperatorViewUrls([{ ...operator, url }]), { updated: 1, skipped: 0, errors: [] });
+  assert.equal(f.client.rows.get(operator.recordId).fields.本人客资只读入口, url);
+  assert.equal(f.client.rows.get(operator.recordId).fields.个人表链接, previousForm);
+  assert.deepEqual(Object.keys(f.client.writes[0].fields).sort(), ['最近处理时间', '本人客资只读入口'].sort());
+  assert.equal((await f.roster.recordOperatorViewUrls([{ ...operator, url }])).updated, 0);
+  f.client.change('Operator', { enabled: false });
+  assert.equal((await f.roster.recordOperatorViewUrls([{ ...operator, url: `${url}Changed` }])).updated, 0);
+  assert.equal((await f.roster.recordOperatorViewUrls([{ ...operator, url: 'https://outside.invalid/base/OfflineOperatorView12345' }])).errors[0].code, 'STAFF_OPERATOR_URL_INVALID');
+});
+
+test('an operator disabled during the final URL recheck cannot receive a stale entry result', async t => {
+  const f = fixture(t, { config: config({ extraFields: true, operatorViews: true }), rows: [row('A'), row('B'), row('Operator', { role: '运营' })] });
+  await f.roster.refresh({ apply: true }); const operator = f.roster.operatorCandidates()[0]; f.client.writes.length = 0;
+  let reads = 0;
+  f.client.beforeRead = id => { if (id === operator.recordId && ++reads === 2) f.client.change('Operator', { enabled: false }); };
+  const result = await f.roster.recordOperatorViewUrls([{ ...operator, url: 'https://offline.feishu.cn/base/OfflineOperatorView12345' }]);
+  assert.equal(result.errors[0].code, 'STAFF_SNAPSHOT_CHANGED'); assert.equal(f.client.writes.length, 0);
+});
+
+test('invalid external sales contact holds only its notice profile while every otherwise eligible sale remains dispatchable', async t => {
+  const f = fixture(t, { config: config({ extraFields: true }), rows: [row('A', { salesWechat: 'valid_public_contact' }), row('B')] });
+  await f.roster.refresh({ apply: true });
+  for (const salesWechat of ['x'.repeat(81), 'invalid\ncontact', 'invalid\u0000contact']) {
+    f.client.change('A', { salesWechat }); const result = await f.roster.refresh({ apply: true });
+    assert.equal(result.ok, false); assert.equal(f.roster.status().healthy, true);
+    assert.equal(result.errors[0].code, 'STAFF_SALES_WECHAT_INVALID');
+    assert.equal(byId(f.roster, 'sales_A').salesWechat, '');
+    assert.equal(byId(f.roster, 'sales_A').enabled, true); assert.equal(byId(f.roster, 'sales_B').enabled, true);
+    assert.equal(await f.roster.verifyCandidate(byId(f.roster, 'sales_A')), true);
+    assert.doesNotThrow(() => validateWorkflowConfig(f.roster.configForMembers()));
+    assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '需核查');
+    assert.equal(f.client.rows.get('recStaffA').fields.问题说明, 'STAFF_SALES_WECHAT_INVALID');
+  }
+  f.client.change('A', { salesWechat: 'corrected_public_contact' });
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(byId(f.roster, 'sales_A').salesWechat, 'corrected_public_contact');
+  assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '可用');
 });

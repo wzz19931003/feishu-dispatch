@@ -1,1 +1,1 @@
-export const WORKFLOW_RELEASE = '2.1.0';
+export const WORKFLOW_RELEASE = '2.2.1';

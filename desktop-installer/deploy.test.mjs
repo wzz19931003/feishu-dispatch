@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync, backup } from 'node:sqlite';
 import { applyRelease } from './deploy.mjs';
 
 function write(root, relative, value) {
@@ -186,4 +187,49 @@ test('a second installer cannot run hooks while the first holds the project lock
     assert.deepEqual(f.calls, ['status:initial']);
   } finally { release(); }
   assert.equal((await first).ok, true);
+});
+
+test('an in-place upgrade preserves real SQLite WAL, outbox receipts, mirror mappings and private settings', async t => {
+  const f = fixture(t);
+  const filename = path.join(f.root, 'data', 'workflow.sqlite');
+  fs.unlinkSync(filename);
+  const db = new DatabaseSync(filename);
+  try {
+    db.exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+      CREATE TABLE v2_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE v2_outbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);
+      CREATE TABLE v2_mirrors(id TEXT PRIMARY KEY,data TEXT NOT NULL);
+      CREATE TABLE v2_staff_registry(id TEXT PRIMARY KEY,data TEXT NOT NULL);`);
+    db.prepare('INSERT INTO v2_meta VALUES(?,?)').run('initialized', 'true');
+    const sent = JSON.stringify({ recordId: 'recFixture', state: 'sent', messageId: 'om_fixture', sentAt: '2026-11-19T00:00:00.000Z' });
+    const mirror = JSON.stringify({ sourceId: 'recFixture', targetRecordId: 'recFixtureChild', state: 'active' });
+    db.prepare('INSERT INTO v2_outbox VALUES(?,?)').run('sent-once', sent);
+    db.prepare('INSERT INTO v2_outbox VALUES(?,?)').run('awaiting-review', JSON.stringify({ state: 'review', errorCode: 'SEND_OUTCOME_UNKNOWN' }));
+    db.prepare('INSERT INTO v2_mirrors VALUES(?,?)').run('trusted-source-child', mirror);
+    db.prepare('INSERT INTO v2_staff_registry VALUES(?,?)').run('staff-fixture', JSON.stringify({ ready: true }));
+    const before = new Map([filename, `${filename}-wal`].map(file => [file, fs.readFileSync(file)]));
+    const backupFolder = path.join(f.root, 'backups', 'fresh-consistent');
+    fs.mkdirSync(backupFolder);
+    f.input.backup = async () => {
+      assert.equal(f.states.active, false);
+      await backup(db, path.join(backupFolder, 'workflow.sqlite'));
+      return { integrity: 'ok', folder: backupFolder };
+    };
+    const result = await applyRelease(f.input);
+    assert.equal(result.ok, true);
+    assert.equal(f.states.startCalls, 1);
+    assert.equal(f.read('config.workflow.local.json'), 'private-old');
+    assert.equal(f.read('backups/old.sqlite'), 'backup-old');
+    assert.equal(f.read('node_modules/package/index.mjs'), 'dependency-old');
+    for (const [file, bytes] of before) assert.deepEqual(fs.readFileSync(file), bytes);
+    assert.ok(fs.existsSync(`${filename}-shm`));
+    const saved = new DatabaseSync(path.join(backupFolder, 'workflow.sqlite'), { readOnly: true });
+    try {
+      assert.equal(saved.prepare("SELECT value FROM v2_meta WHERE key='initialized'").get().value, 'true');
+      assert.equal(saved.prepare("SELECT data FROM v2_outbox WHERE id='sent-once'").get().data, sent);
+      assert.equal(saved.prepare("SELECT data FROM v2_outbox WHERE id='awaiting-review'").get().data, JSON.stringify({ state: 'review', errorCode: 'SEND_OUTCOME_UNKNOWN' }));
+      assert.equal(saved.prepare("SELECT data FROM v2_mirrors WHERE id='trusted-source-child'").get().data, mirror);
+      assert.equal(saved.prepare('SELECT COUNT(*) AS count FROM v2_staff_registry').get().count, 1);
+    } finally { saved.close(); }
+  } finally { db.close(); }
 });

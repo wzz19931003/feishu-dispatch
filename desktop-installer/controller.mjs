@@ -99,7 +99,7 @@ async function useExistingProject(root, startup, shouldResume, online = null) {
   const difference = proposed[0] - old[0] || proposed[1] - old[1] || proposed[2] - old[2];
   if (difference < 0 || online && difference <= 0) fail('WORKFLOW_DOWNGRADE_REFUSED');
   const bindStaff = Boolean(resource && rawConfig.staffManagement?.enabled !== true);
-  const nextRawConfig = bindStaff ? { ...rawConfig, staffManagement: resource.staffManagement } : rawConfig;
+  let nextRawConfig = bindStaff ? { ...rawConfig, staffManagement: resource.staffManagement } : rawConfig;
   // Verify extracted code before importing the release's configuration validator.
   if (new Set(manifest.files.map(file => file.path)).size !== allowlist.length || allowlist.some(item => !manifest.files.some(file => file.path === item))) fail('INSTALL_RELEASE_INVENTORY_INVALID');
   for (const item of allowlist) {
@@ -109,9 +109,24 @@ async function useExistingProject(root, startup, shouldResume, online = null) {
   }
   if (await readVersion(engine) !== manifest.version) fail('INSTALL_RELEASE_VERSION_MISMATCH');
   const { pathToFileURL } = await import('node:url');
+  const needsV22Preparation = Number(manifest.version.split('.')[1]) >= 2 && nextRawConfig.staffManagement?.enabled === true;
+  if (needsV22Preparation) {
+    const { prepareV22Config } = await import(pathToFileURL(path.join(engine, 'production-v2', 'prepare-v22-config.mjs')).href);
+    const { WorkflowClient } = await import(pathToFileURL(path.join(engine, 'production-v2', 'client.mjs')).href);
+    const prepared = await prepareV22Config(nextRawConfig, new WorkflowClient(nextRawConfig));
+    if (!prepared || prepared.staffManagement?.enabled !== true || prepared.staffManagement.operatorViews?.enabled !== true) fail('V22_FEATURES_NOT_READY');
+    for (const key of ['appId', 'appSecret', 'appToken', 'allowedHost', 'enabled']) {
+      if (prepared[key] !== nextRawConfig[key]) fail('V22_PROTECTED_CONFIG_CHANGED');
+    }
+    if (JSON.stringify(prepared.notification) !== JSON.stringify(nextRawConfig.notification)
+      || JSON.stringify(prepared.tableIds) !== JSON.stringify(nextRawConfig.tableIds)
+      || JSON.stringify(prepared.members) !== JSON.stringify(nextRawConfig.members)) fail('V22_PROTECTED_CONFIG_CHANGED');
+    nextRawConfig = prepared;
+  }
   const { validateWorkflowConfig } = await import(pathToFileURL(path.join(engine, 'production-v2', 'field-map.mjs')).href);
   const candidate = validateWorkflowConfig(nextRawConfig);
   const nextConfig = Buffer.from(`${JSON.stringify(nextRawConfig, null, 2)}\n`, 'utf8');
+  const configurationChanged = JSON.stringify(nextRawConfig) !== JSON.stringify(rawConfig);
 
   const dataDir = await lstat(path.dirname(database));
   if (!dataDir.isDirectory() || dataDir.isSymbolicLink()) fail('INSTALL_DB_DIRECTORY_UNSAFE');
@@ -138,7 +153,7 @@ async function useExistingProject(root, startup, shouldResume, online = null) {
   if (initial.listener.runnerRelease && initial.listener.runnerRelease !== installedVersion && installedVersion !== '2.0.0') fail('RUNNING_RELEASE_UNSUPPORTED');
   const shouldArm = startup === 'on' || (startup === 'preserve' && initial.taskState !== 'Disabled');
   const activeConfig = candidate.enabled && candidate.notification.enabled;
-  let backupFolder, changedBinding = false, suspended = false, taskStartRequested = false;
+  let backupFolder, changedConfig = false, suspended = false, taskStartRequested = false;
 
   const suspend = async () => {
     if (!suspended) { await callTask('suspend'); suspended = true; }
@@ -159,18 +174,18 @@ async function useExistingProject(root, startup, shouldResume, online = null) {
           return;
         }
         await callTask('configure');
-        if (bindStaff) {
+        if (configurationChanged) {
           await replaceConfig(configFile, configBefore, nextConfig);
-          changedBinding = true;
+          changedConfig = true;
         }
         try {
           const { stdout } = await runNode([cli, '--check'], 'INSTALLED_PREFLIGHT_FAILED');
           if (!parse(stdout).allowedHostIsThisHost) fail('NOT_CONFIGURED_PRODUCTION_COMPUTER');
           await runNode([cli, '--inspect'], 'FEISHU_SCHEMA_CHECK_FAILED');
         } catch (error) {
-          if (changedBinding) {
+          if (changedConfig) {
             await replaceConfig(configFile, nextConfig, configBefore);
-            changedBinding = false;
+            changedConfig = false;
           }
           throw error;
         }
@@ -205,11 +220,12 @@ async function useExistingProject(root, startup, shouldResume, online = null) {
       },
     });
     const scheduled = !result.resumed && shouldArm && activeConfig ? await callTask('arm') : await callTask('inspect');
-    return { ok: true, version: manifest.version, backupFolder, recoveryDir: result.recoveryDir, staffBound: Boolean(candidate.staffManagement?.enabled), resumed: result.resumed, healthVerified: result.resumed, loginEnabled: scheduled.loginEnabled && scheduled.taskState !== 'Disabled' };
+    return { ok: true, version: manifest.version, backupFolder, recoveryDir: result.recoveryDir, staffBound: Boolean(candidate.staffManagement?.enabled),
+      v22Configured: needsV22Preparation, resumed: result.resumed, healthVerified: result.resumed, loginEnabled: scheduled.loginEnabled && scheduled.taskState !== 'Disabled' };
   } catch (error) {
-    if (!taskStartRequested && error.rollback === 'code_restored' && changedBinding) {
+    if (!taskStartRequested && error.rollback === 'code_restored' && changedConfig) {
       await replaceConfig(configFile, nextConfig, configBefore);
-      changedBinding = false;
+      changedConfig = false;
     }
     if (suspended && !taskStartRequested && error.rollback === 'code_restored') {
       await callTask('configure', initial.loginEnabled ? 'on' : 'off').catch(() => {});

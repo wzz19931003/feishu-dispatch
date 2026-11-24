@@ -13,8 +13,8 @@ export function summarize(db) {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) throw new Error('BACKUP_SCHEMA_INVALID');
     counts[table] = db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
   }
-  for(const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'v2_staff_*' ORDER BY name").all()){
-    if(!/^v2_staff_[a-z0-9_]+$/.test(name))throw new Error('BACKUP_STAFF_SCHEMA_INVALID');
+  for(const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name GLOB 'v2_staff_*' OR name GLOB 'v2_operator_*') ORDER BY name").all()){
+    if(!/^v2_(staff|operator)_[a-z0-9_]+$/.test(name))throw new Error('BACKUP_EXTENSION_SCHEMA_INVALID');
     counts[name]=db.prepare(`SELECT COUNT(*) n FROM ${name}`).get().n;
   }
   return { integrity: 'ok', counts };

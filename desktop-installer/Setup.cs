@@ -594,6 +594,9 @@ internal static class EmbeddedInstaller
             string version = TextValue(status, "version");
             if (SafeVersion.IsMatch(version)) summary.AppendLine("版本 " + version);
             if (HasBoolean(status, "staffBound", true)) summary.AppendLine("员工管理表已接入。");
+            if (HasBoolean(status, "v22Configured", true)) summary.AppendLine("2.2 新增字段与运营查看已接入。");
+            else if (HasBoolean(status, "v22Configured", false) && SafeVersion.IsMatch(version) && new Version(version).CompareTo(new Version("2.2.0")) >= 0)
+                summary.AppendLine("当前项目未启用员工管理，本次完成程序升级。");
             if (HasBoolean(status, "resumed", true)) summary.AppendLine("原派单已恢复运行。");
             else if (HasBoolean(status, "resumed", false)) summary.AppendLine("本次安装没有启动派单。");
             if (HasBoolean(status, "healthVerified", true)) summary.AppendLine("运行状态检查已通过。");
@@ -685,7 +688,7 @@ internal static class EmbeddedInstaller
             if (values.TryGetValue(key, out value) && value is string && SafeCode.IsMatch((string)value) && codes.Count < 8)
                 codes.Add((string)value);
         }
-        foreach (string key in new[] { "ok", "resumed", "healthVerified", "staffBound", "loginEnabled", "startRequested", "updateAvailable" })
+        foreach (string key in new[] { "ok", "resumed", "healthVerified", "staffBound", "v22Configured", "loginEnabled", "startRequested", "updateAvailable" })
         {
             object value;
             if (values.TryGetValue(key, out value) && value is bool) status[key] = value;

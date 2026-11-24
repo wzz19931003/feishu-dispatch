@@ -12,6 +12,7 @@ import { WORKFLOW_RELEASE } from './version.mjs';
 import { StaffRoster, resolveStaffSchema } from './staff-roster.mjs';
 import { StaffProvisioner } from './staff-provisioner.mjs';
 import { StaffAdminClient } from './staff-admin-client.mjs';
+import { OperatorMirror } from './operator-mirror.mjs';
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 export function readConfig(root = ROOT) {
@@ -45,18 +46,22 @@ function safeStatus(engine) {
   if(Number.isSafeInteger(value.staffEventsPending))counts.staff_events_pending=value.staffEventsPending;
   for (const [key,n] of Object.entries(value.mirror || {})) if (/^[A-Za-z0-9_-]{1,60}$/.test(key) && Number.isSafeInteger(n) && n>=0) counts[`mirror_${key}`]=n;
   for(const [key,n] of Object.entries(value.staff?.counts||{}))if(/^[A-Za-z0-9_-]{1,60}$/.test(key)&&Number.isSafeInteger(n)&&n>=0)counts[`staff_${key}`]=n;
+  for (const [key, n] of Object.entries(value.operatorMirror || {})) {
+    if (/^[A-Za-z0-9_-]{1,60}$/.test(key) && Number.isSafeInteger(n) && n >= 0 && key !== 'nextRetryAt') counts[`operator_mirror_${key}`] = n;
+  }
   return { initialized: value.initialized === true, counts,
     ...(value.staff?{staffHealthy:value.staff.healthy===true,staffErrors:(value.staff.errors||[]).map(error=>safeCode(typeof error==='string'?{code:error}:error))}:{}),
     ...(value.lastScan?.at ? { lastScan: { at: value.lastScan.at, scanned: value.lastScan.scanned ?? null } } : {}),
     nextRetryAt: Number.isSafeInteger(value.nextRetryAt) ? value.nextRetryAt : null };
 }
-export async function createEngine(config, { root = ROOT, client = new WorkflowClient(config), Engine = WorkflowEngine, Mirror = SalesMirror, Roster=StaffRoster, Provisioner=StaffProvisioner, Admin=StaffAdminClient } = {}) {
+export async function createEngine(config, { root = ROOT, client = new WorkflowClient(config), Engine = WorkflowEngine, Mirror = SalesMirror, Roster=StaffRoster, Provisioner=StaffProvisioner, Admin=StaffAdminClient, Operator=OperatorMirror } = {}) {
   const engine = new Engine({ config, client, dbPath: path.resolve(root, config.dbPath), memberProvider: () => readConfig(root) });
   try {
     if(config.staffManagement?.enabled){
       const staff=new Roster({config,db:engine.db,client});
       staff.assertLiveConfig=()=>engine.refreshMembers({persist:false});
-      staff.provisioner=new Provisioner({config,db:engine.db,client:new Admin(config,{sourceClient:client}),readCurrent:async id=>{
+      const admin = new Admin(config, { sourceClient: client });
+      staff.provisioner=new Provisioner({config,db:engine.db,client:admin,readCurrent:async id=>{
         await engine.refreshMembers({persist:false});return staff.readCurrent(id);
       }});
       engine.staff=staff;
@@ -64,6 +69,17 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
         const fresh=readConfig(root),effective=staff.configForMembers();
         return{...fresh,members:engine.staffFailure?effective.members.map(member=>({...member,enabled:false})):effective.members};
       };
+      if (config.staffManagement.operatorViews?.enabled) {
+        engine.operatorMirror = new Operator({ config, db: engine.db, client: admin, maxWrites: 12,
+          readSource: id => engine.readSource(id), resolveSource: () => engine.resolveSource(),
+          assertLiveConfig: () => engine.refreshMembers({ persist: false }),
+          verifyOperator: async operator => {
+            const current = await staff.readCurrent(operator.recordId);
+            return Boolean(current?.effectiveEnabled && current.role === 'operator' &&
+              current.openId === operator.openId && current.version === operator.version);
+          },
+        });
+      }
     }
     const clients = new Map([[config.appToken, client]]);
     engine.mirror = new Mirror({ config: engine.config, db: engine.db, sourceClient: client,

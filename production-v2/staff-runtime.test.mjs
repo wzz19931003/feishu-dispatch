@@ -15,7 +15,12 @@ const sourceNames = { owner: '负责人', operator: '录入运营', wx: '微信�
 const sourceTypes = { owner: 11, operator: 11, wx: 1, needs: 1, wxStatus: 3, addMethod: 3, partySize: 1, actualSlot: 2, actualSort: 2, salesName: 1 };
 const staffNames = { employee: '员工', role: '岗位', enabled: '接收新单', order: '接单顺序', notes: '备注', status: '状态', personalUrl: '个人入口', updatedAt: '更新时间', error: '错误' };
 const staffTypes = { employee: 11, role: 3, enabled: 7, order: 2, notes: 1, status: 1, personalUrl: 1, updatedAt: 1, error: 1 };
+const newSourceFields = { account: ['平台账号名称', 3], leadSource: ['客资来源（付费/自然流）', 3], channel: ['渠道', 3], leadDate: ['日期', 5] };
+const newStaffFields = { salesWechat: ['销售对外微信号', 1], leaveStart: ['休假开始日期', 5], leaveEnd: ['休假结束日期', 5], operatorViewUrl: ['运营客资查看入口', 1] };
+for (const [key, [name]] of Object.entries(newSourceFields)) sourceNames[key] = name;
+for (const [key, [name]] of Object.entries(newStaffFields)) staffNames[key] = name;
 const selects = { wxStatus: ['通过', '未通过', '已删除'], addMethod: ['销售主动加', '客户主动加'], role: ['销售', '运营'] };
+Object.assign(selects, { account: ['离线平台'], leadSource: ['自然流'], channel: ['离线渠道'] });
 const personalKeys = ['wx', 'needs', 'wxStatus', 'addMethod', 'partySize'];
 const sourceDefinitions = () => Object.fromEntries(Object.entries(sourceTypes).map(([key, type]) => [key, { fieldId: `fldRuntimeSource${key}`, types: [type], ...(['owner', 'operator'].includes(key) ? { multiple: false } : {}) }]));
 const seedTarget = number => ({ appToken: `RuntimeSeedSalesBase${number}123`, baseUrl: `https://runtime.feishu.cn/base/RuntimeSeedSalesBase${number}123`, tableId: `tblRuntimeSeed${number}123`,
@@ -117,12 +122,13 @@ class MemoryClient extends WorkflowClient {
   async tenantToken() { return 'fake-runtime-memory-token'; }
   async api(endpoint, options) { return this.service.api(endpoint, options); }
 }
-async function fixture(t) {
+async function fixture(t, config = configuration(), beforeInitialize = () => {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-staff-runtime-'));
   assert.equal(path.dirname(path.resolve(root)), path.resolve(tmpdir())); assert.match(path.basename(root), /^shiyeji-staff-runtime-/);
-  const config = configuration(), file = path.join(root, 'config.workflow.local.json');
+  const file = path.join(root, 'config.workflow.local.json');
   writeFileSync(file, JSON.stringify(config), { flag: 'wx', mode: 0o600 }); mkdirSync(path.join(root, 'data'));
   const service = new Service(config);
+  beforeInitialize(service);
   class OfflineMirror extends SalesMirror { constructor(options) { super({ ...options, clientFactory: appToken => service.client(appToken) }); } }
   const engine = await createEngine(validateWorkflowConfig(config), { root, client: service.client(), Mirror: OfflineMirror });
   t.after(async () => { await engine.close(); rmSync(root, { recursive: true, force: true }); });
@@ -157,6 +163,56 @@ test('real createEngine + staff modules prepare a new target and assign a new le
   assert.deepEqual(JSON.parse(readFileSync(f.file, 'utf8')).members, originalMembers);
   const createdBefore = f.service.created, messagesBefore = f.service.messages.length;
   await f.engine.scan({ apply: true }); assert.equal(f.service.created, createdBefore); assert.equal(f.service.messages.length, messagesBefore);
+});
+
+test('real v2.2 engine, roster and operator mirror keep operator views private while using the new notices', async t => {
+  const config = configuration();
+  for (const [key, [, type]] of Object.entries(newSourceFields)) config.fields.leads[key] = { fieldId: `fldV22Source${key}`, types: [type] };
+  for (const [key, [, type]] of Object.entries(newStaffFields)) config.staffManagement.fields[key] = { fieldId: `fldV22Staff${key}`, types: [type] };
+  config.staffManagement.operatorViews = { enabled: true };
+  const actorA = 'ou_runtime_operator_0001', actorB = 'ou_runtime_operator_0002';
+  const lead = (id, operator, owner = '') => ({ record_id: id, fields: {
+    负责人: owner ? [{ id: owner }] : [], 录入运营: [{ id: operator }], 微信号: 'offline_customer',
+    '客户需求（天数/景点/预算等）': 'offline requirement', 微信状态: '通过', 添加方式: '销售主动加', 出游人数: '2',
+    平台账号名称: '离线平台', 渠道: '离线渠道', '客资来源（付费/自然流）': '自然流', 日期: 1795032000000,
+  } });
+  const f = await fixture(t, config, service => {
+    const source = service.table(SOURCE, SOURCE_TABLE).records;
+    source.set('recRuntimeQuiet', lead('recRuntimeQuiet', actorA, config.members[0].openId));
+    source.set('recRuntimeOther', lead('recRuntimeOther', actorB, config.members[0].openId));
+    service.table(STAFF, STAFF_TABLE).records.get('recRuntimeSeed1').fields.销售对外微信号 = 'offline_sales_public';
+  });
+  const first = await f.engine.scan({ apply: true });
+  assert.equal(first.ok, true, JSON.stringify(first.errors));
+  assert.equal(f.engine.status().operatorMirror.ready, 1);
+  assert.equal(f.service.messages.length, 0);
+  const staffRowA = f.service.table(STAFF, STAFF_TABLE).records.get('recRuntimeOperator');
+  const entry = new URL(staffRowA.fields.运营客资查看入口);
+  const operatorToken = entry.pathname.split('/').at(-1), operatorTable = entry.searchParams.get('table');
+  const personal = f.service.table(operatorToken, operatorTable);
+  assert.deepEqual([...f.service.bases.get(operatorToken).members], [[actorA, 'view']]);
+  assert.equal(f.service.bases.get(operatorToken).private, true);
+  assert.equal(f.service.bases.get(operatorToken).subscribed, false);
+  assert.equal(personal.records.size, 1);
+  assert.equal([...personal.records.values()][0].fields['客资来源（付费/自然流）'], '自然流');
+
+  f.service.table(SOURCE, SOURCE_TABLE).records.set('recRuntimeNewV22', lead('recRuntimeNewV22', actorA));
+  await f.engine.scan({ apply: true });
+  assert.equal(personal.records.size, 2);
+  const seller = f.service.messages.find(message => message.receive_id === config.members[0].openId);
+  const operator = f.service.messages.find(message => message.receive_id === actorA);
+  const sellerText = JSON.parse(seller.content).text;
+  assert.match(sellerText, /所属账号：离线平台/);
+  assert.doesNotMatch(sellerText, /https?:\/\/|自然流/);
+  assert.equal(operator, undefined);
+  assert.equal(f.service.messages.length, 1);
+  f.service.table(SOURCE, SOURCE_TABLE).records.get('recRuntimeNewV22').fields.添加方式 = '客户主动加';
+  await f.engine.scan({ apply: true });
+  const activeAddNotice = f.service.messages.find(message => message.receive_id === actorA);
+  assert.match(JSON.parse(activeAddNotice.content).text, /offline_sales_public/);
+  assert.equal(f.service.messages.length, 2);
+  await f.engine.scan({ apply: true });
+  assert.equal(f.service.messages.length, 2);
 });
 test('one fake WS routes only exact employee Base/table and recognizes newly ready child target dynamically', async t => {
   const f = await fixture(t); await f.engine.scan({ apply: true }); f.addNewEmployee(); await f.engine.scan({ apply: true });
