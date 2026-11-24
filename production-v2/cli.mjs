@@ -13,6 +13,8 @@ import { StaffRoster, resolveStaffSchema } from './staff-roster.mjs';
 import { StaffProvisioner } from './staff-provisioner.mjs';
 import { StaffAdminClient } from './staff-admin-client.mjs';
 import { OperatorMirror } from './operator-mirror.mjs';
+import { createAttachmentAclVerifier, createAttachmentRuntime, validateAttachmentSyncConfig } from './attachment-runtime.mjs';
+import { orderReadinessReport } from './order-feishu-audit.mjs';
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 export function readConfig(root = ROOT) {
@@ -30,7 +32,7 @@ export function assertActivation(config, host = hostname()) {
     || config.allowedHost.toLowerCase() !== host.toLowerCase()) fail('WORKFLOW_HOST_NOT_ALLOWED');
 }
 export function parseArgs(args) {
-  if (args.length !== 1 || !['--check','--activation-check','--inspect','--initialize','--plan','--run','--status','--stop'].includes(args[0])) fail('ARGS_INVALID');
+  if (args.length !== 1 || !['--check','--activation-check','--inspect','--audit-orders','--initialize','--plan','--run','--status','--stop'].includes(args[0])) fail('ARGS_INVALID');
   return args[0];
 }
 export function nextScanTime({now=Date.now(),pollSeconds=600,hasError=false,nextRetryAt=null}={}) {
@@ -49,19 +51,32 @@ function safeStatus(engine) {
   for (const [key, n] of Object.entries(value.operatorMirror || {})) {
     if (/^[A-Za-z0-9_-]{1,60}$/.test(key) && Number.isSafeInteger(n) && n >= 0 && key !== 'nextRetryAt') counts[`operator_mirror_${key}`] = n;
   }
+  for (const [key, n] of Object.entries(value.attachments?.counts || {})) {
+    if (/^[a-z_]{1,40}$/.test(key) && Number.isSafeInteger(n) && n >= 0) counts[`attachments_${key}`] = n;
+  }
   return { initialized: value.initialized === true, counts,
     ...(value.staff?{staffHealthy:value.staff.healthy===true,staffErrors:(value.staff.errors||[]).map(error=>safeCode(typeof error==='string'?{code:error}:error))}:{}),
     ...(value.lastScan?.at ? { lastScan: { at: value.lastScan.at, scanned: value.lastScan.scanned ?? null } } : {}),
+    ...(value.attachmentError ? { attachmentErrorCode: safeCode({ code: value.attachmentError }) } : {}),
     nextRetryAt: Number.isSafeInteger(value.nextRetryAt) ? value.nextRetryAt : null };
 }
-export async function createEngine(config, { root = ROOT, client = new WorkflowClient(config), Engine = WorkflowEngine, Mirror = SalesMirror, Roster=StaffRoster, Provisioner=StaffProvisioner, Admin=StaffAdminClient, Operator=OperatorMirror } = {}) {
+function readFeatureConfig(root, name) {
+  const file = path.join(root, name);
+  if (!existsSync(file)) return undefined;
+  ordinaryFile(file);
+  if (statSync(file).size > 128 * 1024) fail('FEATURE_CONFIGURATION_TOO_LARGE');
+  return JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+}
+const readAttachmentConfig = (root, workflow) => validateAttachmentSyncConfig(readFeatureConfig(root, 'config.attachments.local.json'), workflow);
+export async function createEngine(config, { root = ROOT, client = new WorkflowClient(config), Engine = WorkflowEngine, Mirror = SalesMirror, Roster=StaffRoster, Provisioner=StaffProvisioner, Admin=StaffAdminClient, Operator=OperatorMirror, enableAttachmentRuntime = false } = {}) {
   const engine = new Engine({ config, client, dbPath: path.resolve(root, config.dbPath), memberProvider: () => readConfig(root) });
-  let salesDetails = {};
+  let salesDetails = {}, staffAdmin;
   try {
     if(config.staffManagement?.enabled){
       const staff=new Roster({config,db:engine.db,client});
       staff.assertLiveConfig=()=>engine.refreshMembers({persist:false});
       const admin = new Admin(config, { sourceClient: client });
+      staffAdmin = admin;
       staff.provisioner=new Provisioner({config,db:engine.db,client:admin,readCurrent:async id=>{
         await engine.refreshMembers({persist:false});return staff.readCurrent(id);
       }});
@@ -115,6 +130,31 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
         return clients.get(appToken);
       },
       readSource: id => engine.readSource(id), resolveSource: () => engine.resolveSource() });
+    if (enableAttachmentRuntime) {
+      try {
+        const bindings = readAttachmentConfig(root, config);
+        if (bindings?.enabled) {
+          const verifyLiveConfig = async () => {
+            if (!engine.staff?.healthy || engine.staffFailure ||
+              JSON.stringify(readAttachmentConfig(root, config)) !== JSON.stringify(bindings)) return false;
+            await engine.refreshMembers({ persist: false });
+            return engine.config.enabled && engine.config.notification.enabled;
+          };
+          engine.attachments = createAttachmentRuntime({
+            db: engine.db, client, admin: staffAdmin, source: bindings.source, targetPins: bindings.targetPins,
+            enabledRoles: [...new Set(bindings.targetPins.map(pin => pin.role))], verifyLiveConfig,
+            verifyEffectiveAcl: createAttachmentAclVerifier(bindings.targetPins),
+            readCurrentStaff: (id, { client: scopedClient }) => {
+              const staff = Object.create(engine.staff);
+              staff.client = scopedClient;
+              return staff.readCurrent(id);
+            },
+          });
+        }
+      } catch (error) {
+        engine.attachmentError = safeCode(error);
+      }
+    }
     return engine;
   } catch(error) { await engine.close(); throw error; }
 }
@@ -133,7 +173,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
   assertActivation(config, host);
   const lease = acquireLock(root); // Reuse v1's lock: v1 and v2 cannot run together on this host.
   let engine, events, timer, watcher, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '';
-  let detailController = null, detailsAvailable = false, nextDetailsAt = 0;
+  let detailController = null, detailsAvailable = false, nextDetailsAt = 0, lastIdleTask = 'attachments';
   const wake = () => { dirty = true; detailController?.abort(); };
   const stop = () => { stopping = true; detailController?.abort(); };
   const shouldStop = () => { if (stopping) return true; try { if (stopRequested(lease)) stop(); } catch { stop(); } return stopping; };
@@ -143,7 +183,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
     client ||= new WorkflowClient(config);
-    engine = await makeEngine(config, { root, client });
+    engine = await makeEngine(config, { root, client, enableAttachmentRuntime: true });
     if (!engine.status().initialized) fail('WORKFLOW_INITIALIZATION_REQUIRED');
     events = new Events(engine.config || config);
     const configStamp=()=>{const value=statSync(path.join(root,'config.workflow.local.json'));return `${value.mtimeMs}/${value.size}`;};
@@ -170,8 +210,22 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
         } catch (error) { lastErrorCode = safeCode(error); nextScan = Date.now() + 60000; }
         phase = lastErrorCode ? 'scan_error' : 'polling'; snapshot();
       }
-      if (detailsAvailable && !dirty && !shouldStop() && Date.now() >= nextDetailsAt && nextScan - Date.now() > SALES_DETAIL_BUDGET_MS) {
+      const now = Date.now();
+      const attachmentDue = engine.attachmentDueAt?.();
+      const canRunDetails = detailsAvailable && now >= nextDetailsAt && nextScan - now > SALES_DETAIL_BUDGET_MS;
+      const canRunAttachments = Number.isSafeInteger(attachmentDue) && attachmentDue <= now && nextScan - now >= 20_000;
+      if (!dirty && !shouldStop() && canRunAttachments && (!canRunDetails || lastIdleTask === 'details')) {
         detailController = new AbortController();
+        lastIdleTask = 'attachments';
+        try {
+          const signal = AbortSignal.any([detailController.signal, AbortSignal.timeout(nextScan - now)]);
+          await engine.syncDeferredAttachments({ shouldStop, signal });
+        } finally {
+          detailController = null;
+        }
+      } else if (canRunDetails && !dirty && !shouldStop()) {
+        detailController = new AbortController();
+        lastIdleTask = 'details';
         try {
           const detail = await engine.syncDeferredSalesDetails({ shouldStop, signal: detailController.signal });
           detailsAvailable = (detail?.detailPending || 0) > 0;
@@ -201,6 +255,14 @@ export async function main(args = process.argv.slice(2)) {
   }
   const client = new WorkflowClient(config);
   if (action === '--inspect') { console.log(JSON.stringify(await inspect(config, client))); return; }
+  if (action === '--audit-orders') {
+    const orders = readFeatureConfig(ROOT, 'config.orders.local.json');
+    if (!orders) fail('ORDER_AUDIT_CONFIG_MISSING');
+    const result = await orderReadinessReport({ config: orders, client, admin: new StaffAdminClient(config, { sourceClient: client }) });
+    console.log(JSON.stringify(result));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
   if (action === '--run') return run(config, { client });
   const lease = acquireLock(); let engine;
   try {

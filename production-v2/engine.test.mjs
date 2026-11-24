@@ -52,6 +52,33 @@ async function fixture(t, { config = configuration(), client = new Client(), now
 }
 const numericRejection = () => Object.assign(new Error('offline definite rejection'), { code: '99991400' });
 
+test('attachments stage only after a complete applied scan with a healthy roster', async t => {
+  const { engine, client } = await fixture(t);
+  let healthy = true;
+  engine.staff = { async refresh() { return { ok: healthy }; }, status() { return { healthy }; } };
+  const staged = [];
+  let ticks = 0;
+  engine.attachments = {
+    stageCore(input) { staged.push(input); return true; },
+    status() { return { nextDueAt: 0, counts: {} }; },
+    async runDeferred() { ticks++; return { status: 'updated' }; },
+  };
+  client.add(lead('attachment'));
+  await engine.scan();
+  assert.equal(engine.attachmentDueAt(), null);
+  assert.equal(staged.length, 0);
+  await engine.scan({ apply: true });
+  assert.equal(engine.attachmentDueAt(), 0);
+  assert.equal(staged[0].records[0].record_id, 'recLeadattachment');
+  assert.equal(ticks, 0);
+  assert.equal((await engine.syncDeferredAttachments()).status, 'updated');
+  healthy = false;
+  await engine.scan({ apply: true });
+  assert.equal(staged.length, 1);
+  assert.equal((await engine.syncDeferredAttachments()).status, 'skipped');
+  assert.equal(ticks, 1);
+});
+
 test('initial source history is quiet, including non-passed statuses and customer-active-add', async t => {
   const { engine, client } = await fixture(t, { client: new Client([lead('old', { owner: 'ou_offlineSalesA', wxStatus: '未通过', addMethod: '客户主动加' })]) });
   await engine.scan({ apply: true }); assert.equal(client.writes.length, 0); assert.equal(client.sent.length, 0); assert.equal(engine.all('v2_outbox').length, 0);

@@ -10,7 +10,7 @@ const fingerprint = value => createHash('sha256').update(JSON.stringify(canonica
 const safeCode = error => /^[A-Z0-9_]{1,80}$/.test(String(error?.code || '')) ? String(error.code) : 'MIRROR_REMOTE_ERROR';
 const absent = error => ['1254043', 'RECORD_NOT_FOUND', 'SOURCE_RECORD_NOT_FOUND', 'SOURCE_NOT_FOUND'].includes(String(error?.code || ''));
 const COPY_FIELDS = Object.freeze(['wx', 'needs', 'wxStatus', 'addMethod', 'partySize', 'salesName']);
-const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'addMethod', 'partySize']);
+const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'partySize']);
 const STATUS_WRITEBACK_UNCONFIRMED = 'MIRROR_STATUS_WRITEBACK_OUTCOME_UNKNOWN';
 export const SALES_DETAIL_BUDGET_MS = 12_000;
 const SALES_DETAIL_LIMIT_CODES = new Set(['99991400', 'HTTP_429', 'RATE_LIMIT', 'SALES_DETAILS_RATE_LIMIT']);

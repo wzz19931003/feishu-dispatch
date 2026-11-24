@@ -17,6 +17,16 @@ test('targets cannot share a Base, reuse source, or accept owner as feedback', (
   c = workflowConfig(); c.mirrors.feedbackFields = ['wxStatus', 'owner'];
   assert.throws(() => validateWorkflowConfig(c), { code: 'FEEDBACK_FIELDS_INVALID' });
 });
+test('legacy addMethod feedback is retired without changing its field bindings or wxStatus', () => {
+  const raw = workflowConfig();
+  raw.mirrors.feedbackFields = ['wxStatus', 'addMethod', 'wx'];
+  const prepared = validateWorkflowConfig(raw);
+  assert.deepEqual(prepared.mirrors.feedbackFields, ['wxStatus', 'wx']);
+  assert.deepEqual(raw.mirrors.feedbackFields, ['wxStatus', 'addMethod', 'wx']);
+  assert.deepEqual(prepared.fields.leads.addMethod, raw.fields.leads.addMethod);
+  assert.deepEqual(prepared.members[0].target.fields.addMethod, raw.members[0].target.fields.addMethod);
+  assert.deepEqual(validateWorkflowConfig(prepared).mirrors.feedbackFields, ['wxStatus', 'wx']);
+});
 test('stable field IDs follow renamed columns and encode current names', async () => {
   const c = workflowConfig(), fields = schema(c); fields.find(f => f.field_id === c.fields.leads.wx.fieldId).field_name = '重新命名的微信列';
   const resolved = await resolveFields({ api: async () => ({ items: fields }) }, { appToken: c.appToken, tableId: c.tableIds.leads, fields: c.fields.leads });

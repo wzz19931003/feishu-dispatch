@@ -324,14 +324,34 @@ test('a rate-limited scalar attempt leaves both sales targets quiet for the rest
   } finally { f.close(); }
 });
 
-test('optional wx, needs, addMethod and partySize feedback needs explicit whitelist', async () => {
-  const f = fixture({ feedbackFields: ['wxStatus', 'wx', 'needs', 'addMethod', 'partySize'] });
+test('approved optional feedback and wxStatus write back while addMethod stays source-authoritative', async () => {
+  const f = fixture({ feedbackFields: ['wxStatus', 'wx', 'needs', 'partySize'] });
   try {
     const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
-    Object.assign(f.salesA.records.get(targetRecordId).fields, { Wechat: 'corrected-fixture', Needs: 'updated-needs', 'Add method': '销售主动加', 'Party size': 3 });
+    const child = f.salesA.records.get(targetRecordId);
+    Object.assign(child.fields, { Wechat: 'corrected-fixture', Needs: 'updated-needs', 'Add method': '销售主动加', 'Wechat status': '未通过', 'Party size': 3 });
     await f.mirror.sync();
     const patch = f.log.find(entry => entry.base === sourceToken && entry.op === 'update').fields;
-    assert.deepEqual(patch, { Wechat: 'corrected-fixture', Needs: 'updated-needs', 'Add method': '销售主动加', 'Party size': 3 });
+    assert.deepEqual(patch, { Wechat: 'corrected-fixture', Needs: 'updated-needs', 'Wechat status': '未通过', 'Party size': 3 });
+    assert.equal(f.source.records.get('recSource1').fields['Add method'], '客户主动加');
+    assert.equal(child.fields['Add method'], '客户主动加');
+    f.config.mirrors.feedbackFields = ['wxStatus', 'addMethod'];
+    assert.throws(f.construct, { code: 'MIRROR_FEEDBACK_INVALID' });
+  } finally { f.close(); }
+});
+
+test('a persisted legacy addMethod retry is cleared without updating the master value', async () => {
+  const f = fixture();
+  try {
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    const child = f.salesA.records.get(targetRecordId);
+    f.mirror.put({ ...f.mirror.latest('recSource1'), pendingFeedback: { addMethod: '销售主动加' },
+      feedbackAttempts: 8, feedbackBlocked: true, feedbackNextAttemptAt: Date.now() + 60_000 });
+    child.fields['Add method'] = '销售主动加';
+    await f.construct().sync();
+    assert.ok(!f.log.some(entry => entry.base === sourceToken && entry.op === 'update'));
+    assert.equal(child.fields['Add method'], '客户主动加');
+    assert.equal(f.mirror.latest('recSource1').pendingFeedback, null);
   } finally { f.close(); }
 });
 

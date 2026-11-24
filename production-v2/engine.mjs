@@ -275,6 +275,24 @@ export class WorkflowEngine {
     })().finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
+  syncDeferredAttachments(options = {}) {
+    if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
+    if (this.inFlight) return Promise.reject(new WorkflowError('ENGINE_BUSY'));
+    if (!this.config.enabled || !this.attachmentsReady || !this.attachments || stopped(options.shouldStop) || options.signal?.aborted) {
+      return Promise.resolve({ status: 'skipped' });
+    }
+    this.inFlight = this.attachments.runDeferred(options).catch(error => {
+      this.attachmentsReady = false;
+      this.attachmentError = safeCode(error);
+      return { status: 'review' };
+    }).finally(() => { this.inFlight = null; });
+    return this.inFlight;
+  }
+  attachmentDueAt() {
+    if (!this.attachmentsReady || !this.attachments) return null;
+    const due = this.attachments.status().nextDueAt;
+    return Number.isSafeInteger(due) && due >= 0 ? due : null;
+  }
   preview(view) {
     const old = this.get('v2_snapshots', view.id), actions = [];
     if (old?.view.owner && !view.owner) actions.push('owner_cleared');
@@ -292,6 +310,7 @@ export class WorkflowEngine {
     if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
+    if (apply) this.attachmentsReady = false;
     const acknowledgedEvents = apply ? this.all('v2_inbox').filter(event => event.state === 'pending').map(event => event.id) : [];
     const acknowledgedStaffEvents=apply?this.staffEvents().filter(event=>event.state==='pending').map(event=>event.id):[];
     const staffResult=await this.refreshStaff({apply,shouldStop});
@@ -346,6 +365,14 @@ export class WorkflowEngine {
       }
       for (const id of acknowledgedEvents) { const event = this.get('v2_inbox', id); if (event?.state === 'pending') this.put('v2_inbox', { ...event, state: 'done', processedAt: this.stamp() }); }
       if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
+      if (this.attachments && staffResult.healthy === true && !errors.length && sourceViews.length === records.length && !stopped(shouldStop)) {
+        try {
+          this.attachmentsReady = this.attachments.stageCore({ apply, healthy: true, complete: true, records }) === true;
+          this.attachmentError = '';
+        } catch (error) {
+          this.attachmentError = safeCode(error);
+        }
+      }
     }
     const counts = {};
     for (const plan of plans) for (const action of plan.actions) counts[action] = (counts[action] || 0) + 1;
@@ -612,7 +639,9 @@ export class WorkflowEngine {
       reviews: this.all('v2_reviews').filter(review => review.state === 'open').length, eventsPending: this.all('v2_inbox').filter(event => event.state === 'pending').length,
       staffEventsPending:this.staffEvents().filter(event=>event.state==='pending').length,
       nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: this.meta('mirror_status') || {},
-      operatorMirror: this.meta('operator_mirror_status') || {}, ...(this.staff?{staff:this.staff.status()}:{} ) };
+      operatorMirror: this.meta('operator_mirror_status') || {}, ...(this.staff?{staff:this.staff.status()}:{} ),
+      ...(this.attachments ? { attachments: this.attachments.status() } : {}),
+      ...(this.attachmentError ? { attachmentError: this.attachmentError } : {}) };
   }
   async close() { if (this.closed) return; try { if (this.inFlight) await this.inFlight; } finally { this.closed = true;try{await this.staff?.close?.();}finally{this.db.close();} } }
 }

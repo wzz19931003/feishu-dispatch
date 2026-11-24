@@ -13,7 +13,7 @@ export const EXTRA_SOURCE_FIELDS = { account: [1, 3], channel: [1, 3], leadSourc
 export const SALES_DETAIL_COLUMNS = Object.freeze({ leadDate: { name: '日期', type: 5 }, operatorName: { name: '运营名字', type: 1 } });
 const FIELD_TYPES = { owner: [11], operator: [11], wx: [1], needs: [1], wxStatus: [1, 3], addMethod: [1, 3], partySize: [1, 2], actualSlot: [2], actualSort: [2], salesName: [1], ...EXTRA_SOURCE_FIELDS };
 const REQUIRED_SOURCE = ['owner', 'operator', 'wx', 'needs', 'wxStatus', 'addMethod', 'actualSlot', 'actualSort', 'salesName'];
-const FEEDBACK = ['wxStatus', 'wx', 'needs', 'addMethod', 'partySize'];
+const FEEDBACK = ['wxStatus', 'wx', 'needs', 'partySize'];
 
 function fieldDefinitions(raw) {
   if (!object(raw) || !Object.keys(raw).length) fail('FIELDS_REQUIRED');
@@ -56,8 +56,11 @@ export function validateWorkflowConfig(raw, { requireTargets = true } = {}) {
   if (raw.mirrors?.enabled !== undefined && typeof raw.mirrors.enabled !== 'boolean') fail('MIRRORS_INVALID');
   if (raw.mirrors?.enabled === false) fail('MIRRORS_REQUIRED');
   if (raw.mirrors?.salesDetails !== undefined && typeof raw.mirrors.salesDetails !== 'boolean') fail('MIRRORS_INVALID');
-  const feedbackFields = raw.mirrors?.feedbackFields ?? ['wxStatus'];
-  if (!Array.isArray(feedbackFields) || !feedbackFields.includes('wxStatus') || new Set(feedbackFields).size !== feedbackFields.length || feedbackFields.some(key => !FEEDBACK.includes(key) || !fields[key])) fail('FEEDBACK_FIELDS_INVALID');
+  const configuredFeedback = raw.mirrors?.feedbackFields ?? ['wxStatus'];
+  if (!Array.isArray(configuredFeedback) || !configuredFeedback.includes('wxStatus') || new Set(configuredFeedback).size !== configuredFeedback.length) fail('FEEDBACK_FIELDS_INVALID');
+  // Older installations could allow sales to change this source-owned field.
+  const feedbackFields = configuredFeedback.filter(key => key !== 'addMethod');
+  if (feedbackFields.some(key => !FEEDBACK.includes(key) || !fields[key])) fail('FEEDBACK_FIELDS_INVALID');
   if (!Array.isArray(raw.members) || !raw.members.length) fail('MEMBERS_REQUIRED');
   const ids = new Set(), identities = new Set(), targets = new Set(), pendingTargets = [];
   const members = raw.members.map(member => {

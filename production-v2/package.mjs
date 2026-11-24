@@ -9,6 +9,8 @@ export const ROOT=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'
 export const ALLOWLIST=Object.freeze([
   'package.json','package-lock.json','config.workflow.example.json','lib/feishu.mjs','production/engine.mjs','production/control.mjs',
   'production-v2/engine.mjs','production-v2/field-map.mjs','production-v2/sales-mirror.mjs','production-v2/operator-mirror.mjs','production-v2/cli.mjs','production-v2/events.mjs','production-v2/client.mjs','production-v2/version.mjs',
+  'production-v2/attachment-runtime.mjs','production-v2/attachment-mirror-adapter.mjs','production-v2/attachment-sync-worker.mjs','production-v2/bitable-attachment.mjs',
+  'production-v2/order-schema.mjs','production-v2/order-feishu-audit.mjs','production-v2/order-sync.mjs',
   'production-v2/migration.mjs','production-v2/prepare-config.mjs','production-v2/prepare-v22-config.mjs','production-v2/capture-schema.mjs','production-v2/attach-target.mjs',
   'production-v2/staff-config.mjs','production-v2/staff-roster.mjs','production-v2/staff-provisioner.mjs','production-v2/staff-admin-client.mjs','production-v2/prepare-staff-config.mjs',
   'production-v2/backup.mjs','production-v2/restore.mjs','production-v2/Task.ps1','production-v2/Host.ps1','production-v2/README.md',
