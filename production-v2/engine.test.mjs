@@ -52,6 +52,269 @@ async function fixture(t, { config = configuration(), client = new Client(), now
 }
 const numericRejection = () => Object.assign(new Error('offline definite rejection'), { code: '99991400' });
 
+test('seven master-event records notify before any full-table or mirror scan and retain restart deduplication', async t => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'workflow-event-notices-'));
+  const dbPath = path.join(folder, 'workflow.sqlite');
+  const { engine, client, mirror } = await fixture(t, { dbPath });
+  let resumed;
+  t.after(async () => { await resumed?.close(); await engine.close(); rmSync(folder, { recursive: true, force: true }); });
+  const ids = [];
+  for (let index = 0; index < 7; index++) { const record = lead(`event${index}`); ids.push(record.record_id); client.add(record); }
+  const list = client.listRecords.bind(client), sync = mirror.sync.bind(mirror);
+  client.listRecords = async () => { throw new Error('targeted notices must precede full-table reads'); };
+  mirror.sync = async () => { throw new Error('targeted notices must precede full mirror reconciliation'); };
+  const event = { id: 'event-seven-new-records', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: ids };
+  assert.equal(engine.acceptEvent(event), true);
+  assert.equal((await engine.processPendingEvents()).processed, 7);
+  assert.equal(client.sent.length, 7);
+  assert.equal(engine.get('v2_inbox', event.id).requiresReconciliation, true);
+  assert.equal(engine.get('v2_inbox', event.id).state, 'pending');
+  assert.equal(engine.acceptEvent(event), false);
+  await engine.processPendingEvents(); assert.equal(client.sent.length, 7);
+  client.listRecords = list; mirror.sync = sync;
+  await engine.scan({ apply: true });
+  assert.equal(engine.get('v2_inbox', event.id).state, 'done');
+  await engine.close();
+  resumed = new WorkflowEngine({ config: configuration(), client, dbPath }); resumed.mirror = new Mirror(resumed);
+  assert.equal(resumed.acceptEvent(event), false);
+  await resumed.processPendingEvents(); await resumed.scan({ apply: true });
+  assert.equal(client.sent.length, 7);
+});
+
+test('targeted event batches stop after ten records and continue durable progress', async t => {
+  const { engine, client } = await fixture(t);
+  const ids = [];
+  for (let index = 0; index < 12; index++) { const record = lead(`batch${index}`); ids.push(record.record_id); client.add(record); }
+  engine.acceptEvent({ id: 'event-twelve-records', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: ids });
+  assert.equal((await engine.processPendingEvents()).processed, 10);
+  assert.equal(client.sent.length, 10);
+  assert.equal(engine.get('v2_inbox', 'event-twelve-records').processedRecordIds.length, 10);
+  assert.equal((await engine.processPendingEvents()).processed, 2);
+  assert.equal(client.sent.length, 12);
+});
+
+test('ten failed event records back off so a newer event can notify', async t => {
+  const { engine, client } = await fixture(t);
+  const blocked = [];
+  for (let index = 0; index < 10; index++) { const record = lead(`blocked${index}`); client.add(record); blocked.push(record.record_id); }
+  const newer = lead('afterBlocked'); client.add(newer);
+  engine.acceptEvent({ id: 'event-blocked', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: blocked });
+  engine.acceptEvent({ id: 'event-newer', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: [newer.record_id] });
+  const read = client.readRecord.bind(client); let failures = 0;
+  client.readRecord = async (table, id) => {
+    if (blocked.includes(id)) { failures++; throw Object.assign(new Error('offline record timeout'), { code: 'NETWORK_OR_TIMEOUT' }); }
+    return read(table, id);
+  };
+  assert.equal((await engine.processPendingEvents()).errors.length, 10);
+  assert.equal((await engine.processPendingEvents()).processed, 1);
+  assert.equal(failures, 10); assert.equal(client.sent.length, 1);
+  const queued = engine.get('v2_inbox', 'event-blocked');
+  assert.equal(queued.state, 'pending');
+  assert(Object.values(queued.retryAtByRecord).every(at => at > Date.now()));
+});
+
+test('a fast unknown send outcome stays in review through reconciliation without replay', async t => {
+  const { engine, client } = await fixture(t); const record = lead('unknownFastSend'); client.add(record);
+  client.sendError = Object.assign(new Error('offline response lost'), { code: 'NETWORK_OR_TIMEOUT' });
+  engine.acceptEvent({ id: 'event-unknown-send', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: [record.record_id] });
+  await engine.processPendingEvents(); client.sendError = null;
+  await engine.processPendingEvents(); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1);
+  assert.equal(engine.all('v2_outbox').find(task => task.recordId === record.record_id).state, 'review');
+});
+
+test('confirmed mirror recovery releases only unsent first attempts before their thirty-second wait', async t => {
+  let time = 1_760_000_000_000;
+  const { engine, client, mirror } = await fixture(t, { now: () => time });
+  const record = lead('mirrorRecovery'); client.add(record);
+  mirror.error = Object.assign(new Error('offline temporary mirror error'), { code: 'MIRROR_FIXTURE_TEMPORARY' });
+  engine.acceptEvent({ id: 'event-mirror-recovery', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: [record.record_id] });
+  await engine.processPendingEvents();
+  const held = engine.all('v2_outbox').find(task => task.kind === 'owner');
+  assert.equal(held.state, 'waiting_mirror'); assert.equal(held.attempts, 0); assert.equal(held.nextAttemptAt, time + 30_000);
+  const currentOwner = engine.get('v2_snapshots', record.record_id).view.owner;
+  const member = engine.config.members.find(member => member.openId === currentOwner);
+  mirror.latest = () => ({ state: 'active', owner: currentOwner, memberId: member.id, target: member.target, targetRecordId: 'recOfflineConfirmedMirror' });
+  const sync = mirror.sync.bind(mirror);
+  mirror.sync = async options => { mirror.error = null; return sync(options); };
+  time += 1000;
+  await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1);
+  assert.equal(client.sent[0].idempotencyKey, held.id);
+  assert.equal(engine.get('v2_outbox', held.id).state, 'sent');
+  assert.equal(engine.get('v2_outbox', held.id).firstAttemptAt, time);
+  engine.put('v2_outbox', { ...held, state: 'waiting_mirror', attempts: 1, delivery: clone(client.sent[0]) });
+  await engine.releaseMirroredNotices(() => false);
+  assert.equal(client.sent.length, 1);
+  assert.equal(engine.get('v2_outbox', held.id).state, 'waiting_mirror');
+});
+
+test('first attempts get reserved delivery capacity while old due retries still progress', async t => {
+  const { engine } = await fixture(t); const delivered = [];
+  for (let index = 0; index < 50; index++) engine.put('v2_outbox', { id: `old-${index}`, state: 'waiting_mirror', attempts: 1, createdAt: '2020-01-01', nextAttemptAt: 0 });
+  engine.put('v2_outbox', { id: 'new-notice', state: 'pending', attempts: 0, createdAt: '2030-01-01', nextAttemptAt: 0 });
+  engine.deliver = async id => { delivered.push(id); };
+  await engine.drain(() => false);
+  assert.equal(delivered.length, 50); assert.equal(delivered[0], 'new-notice');
+  assert.equal(delivered.filter(id => id.startsWith('old-')).length, 49);
+});
+
+test('event-linked records notify before unrelated records and an interrupted scan keeps its completed timestamp', async t => {
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead('older', { owner: 'ou_offlineSalesA' })]) });
+  await engine.scan({ apply: true }); const prior = clone(engine.meta('last_scan'));
+  const record = lead('urgent'); client.add(record);
+  engine.acceptEvent({ id: 'event-urgent', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: [record.record_id] });
+  const process = engine.processRecord.bind(engine); const order = [];
+  engine.processRecord = async (...args) => { order.push(args[0]); if (args[0] === 'recLeadolder') assert.equal(client.sent.length, 1); return process(...args); };
+  let yielded = false;
+  mirror.sync = async () => { yielded = true; return { stopped: true }; };
+  const result = await engine.scan({ apply: true, shouldStop: () => yielded });
+  assert.equal(order[0], record.record_id); assert.equal(result.stopped, true);
+  assert.deepEqual(engine.meta('last_scan'), prior);
+  assert.equal(engine.get('v2_inbox', 'event-urgent').state, 'pending');
+});
+
+for (const change of ['cleared', 'deleted', 'unknown']) test(`a fast ${change} owner retains its normal reconciliation requirement`, async t => {
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead('revoke', { owner: 'ou_offlineSalesA' })]) });
+  if (change === 'deleted') client.records.delete('recLeadrevoke');
+  else client.change('recLeadrevoke', { owner: change === 'cleared' ? '' : 'ou_offlineUnknownOwner' });
+  engine.acceptEvent({ id: `event-${change}`, appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: ['recLeadrevoke'] });
+  await engine.processPendingEvents();
+  const receipt = engine.get('v2_inbox', `event-${change}`);
+  assert.equal(receipt.state, 'pending'); assert.equal(receipt.requiresReconciliation, true);
+  assert.equal(mirror.syncCalls, 0); assert(engine.nextRetryAt() <= Date.now() + 1100);
+  await engine.scan({ apply: true });
+  assert.equal(mirror.syncCalls, 1); assert.equal(engine.get('v2_inbox', `event-${change}`).state, 'done');
+});
+
+test('a failed mirror cleanup keeps durable event intent and retries before ordinary polling', async t => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'workflow-event-reconcile-'));
+  const dbPath = path.join(folder, 'workflow.sqlite');
+  const { engine, client, mirror } = await fixture(t, { dbPath, client: new Client([lead('revoke', { owner: 'ou_offlineSalesA' })]) });
+  let resumed;
+  t.after(async () => { await resumed?.close(); await engine.close(); rmSync(folder, { recursive: true, force: true }); });
+  client.change('recLeadrevoke', { owner: '' });
+  engine.acceptEvent({ id: 'event-persistent-revoke', appToken: engine.config.appToken, tableId: engine.config.tableIds.leads, recordIds: ['recLeadrevoke'] });
+  await engine.processPendingEvents();
+  mirror.sync = async () => ({ reviews: 1 });
+  await engine.scan({ apply: true });
+  assert.equal(engine.get('v2_inbox', 'event-persistent-revoke').state, 'pending');
+  assert(engine.nextRetryAt() <= Date.now() + 30_100);
+  await engine.close();
+  resumed = new WorkflowEngine({ config: configuration(), client, dbPath }); resumed.mirror = new Mirror(resumed);
+  assert.equal(resumed.get('v2_inbox', 'event-persistent-revoke').requiresReconciliation, true);
+  await resumed.scan({ apply: true });
+  assert.equal(resumed.get('v2_inbox', 'event-persistent-revoke').state, 'done');
+  assert.equal(client.sent.length, 0);
+});
+
+test('a valid sales-details snapshot survives an unrelated operator-link failure', async t => {
+  const { engine, mirror } = await fixture(t, { client: new Client([lead('existing', { owner: 'ou_offlineSalesA' })]) });
+  engine.staff = {
+    async refresh() { return { ok: true }; }, status() { return { healthy: true }; },
+    operatorCandidates() { return []; },
+  };
+  mirror.detailEnabled = true;
+  let attempts = 0;
+  mirror.syncDeferredDetails = async () => { attempts++; return { detailWrites: 1, detailPending: 0 }; };
+  engine.operatorMirror = { async sync() { throw Object.assign(new Error('offline operator link'), { code: 'OPERATOR_LINK_FAILURE' }); } };
+  const result = await engine.scan({ apply: true, deferSalesDetails: true });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, [{ code: 'OPERATOR_LINK_FAILURE' }]);
+  assert.equal(result.salesDetailsReady, true);
+  assert.equal((await engine.syncDeferredSalesDetails()).detailWrites, 1);
+  assert.equal(attempts, 1);
+  assert.equal(engine.salesDetailsReady, false);
+});
+
+test('real engine and sales mirror fill three historical private tables including a disabled salesperson', async t => {
+  const config = upgradedFixtureConfig();
+  delete config.fields.leads.account;
+  config.fields.leads.leadDate = { fieldId: 'fldOfflineDetailDate', types: [5] };
+  config.members.push(member('C', 30)); config.members[2].enabled = false;
+  const records = config.members.map((person, index) => {
+    const record = lead(`details${index}`, { owner: person.openId });
+    record.fields.日期 = 1_760_000_000_000 + index * 86_400_000;
+    return record;
+  });
+  const source = new Client(records);
+  source.schema.push({ field_id: 'fldOfflineDetailDate', field_name: '日期', type: 5, property: {} });
+  class Child {
+    constructor(person) { this.person = person; this.records = new Map(); this.metrics = { writes: 0 }; }
+    async api() {
+      return { items: [
+        ...Object.entries(this.person.target.fields).map(([key, spec]) => ({ field_id: spec.fieldId, field_name: names[key], type: spec.types[0] })),
+        { field_id: `fldDetailDate${this.person.id.replaceAll('_', '')}`, field_name: '日期', type: 5 },
+        { field_id: `fldDetailOperator${this.person.id.replaceAll('_', '')}`, field_name: '运营名字', type: 1 },
+      ], has_more: false };
+    }
+    async listRecords() { return { items: clone([...this.records.values()]), hasMore: false }; }
+    async readRecord(table, id) {
+      assert.equal(table, this.person.target.tableId);
+      return clone(this.records.get(id));
+    }
+    async createRecord(table, fields) {
+      assert.equal(table, this.person.target.tableId);
+      const record = { record_id: `recDetails${this.person.id}`, fields: clone(fields) };
+      this.records.set(record.record_id, record); return clone(record);
+    }
+    async updateRecord(table, id, fields) {
+      assert.equal(table, this.person.target.tableId);
+      assert.deepEqual(Object.keys(fields).sort(), ['日期', '运营名字'].sort());
+      Object.assign(this.records.get(id).fields, clone(fields)); this.metrics.writes++;
+      return clone(this.records.get(id));
+    }
+  }
+  const children = new Map(config.members.map(person => [person.target.appToken, new Child(person)]));
+  const engine = new WorkflowEngine({ config, client: source, dbPath: ':memory:' });
+  t.after(() => engine.close());
+  engine.mirror = new SalesMirror({ config: engine.config, db: engine.db, sourceClient: source,
+    clientFactory: token => children.get(token), readSource: id => engine.readSource(id), resolveSource: () => engine.resolveSource(),
+    operatorNames: () => new Map([['ou_offlineOperatorA', 'Offline operator']]), auditDetailsTarget: async () => true });
+  await engine.initialize();
+  engine.staff = { async refresh() { return { ok: true }; }, status() { return { healthy: true }; }, operatorCandidates() { return []; } };
+  engine.operatorMirror = { async sync() { throw Object.assign(new Error('offline unrelated link failure'), { code: 'OPERATOR_LINK_FAILURE' }); } };
+  await engine.scan({ apply: true, deferSalesDetails: true }); // Establish the quiet historical mirrors first.
+  const result = await engine.scan({ apply: true, deferSalesDetails: true });
+  assert.equal(result.ok, false); assert.equal(result.salesDetailsReady, true);
+  for (let index = 0; index < 3; index++) {
+    const detail = await engine.syncDeferredSalesDetails();
+    assert.equal(detail.detailWrites, 1, JSON.stringify({ index, detail }));
+  }
+  for (const [index, person] of config.members.entries()) {
+    const child = children.get(person.target.appToken), record = [...child.records.values()][0];
+    assert.equal(child.metrics.writes, 1);
+    assert.equal(record.fields.日期, records[index].fields.日期);
+    assert.equal(record.fields.运营名字, 'Offline operator');
+    assert.equal(source.records.get(records[index].record_id).fields.负责人[0].id, person.openId);
+  }
+  assert.equal(source.writes.length, 0); assert.equal(source.sent.length, 0);
+});
+
+for (const gate of ['unhealthy', 'incomplete_source', 'mirror_failed', 'details_disabled', 'mirror_stopped']) {
+  test(`sales-details staging rejects ${gate} and invalidates an older staged snapshot`, async t => {
+    const { engine, client, mirror } = await fixture(t, { client: new Client([lead('existing', { owner: 'ou_offlineSalesA' })]) });
+    engine.staff = {
+      async refresh() { return { ok: gate !== 'unhealthy' }; },
+      status() { return { healthy: gate !== 'unhealthy' }; },
+    };
+    mirror.detailEnabled = gate !== 'details_disabled';
+    const sync = mirror.sync.bind(mirror);
+    mirror.sync = async options => {
+      if (gate === 'mirror_failed') throw Object.assign(new Error('offline mirror failure'), { code: 'MIRROR_FIXTURE_FAILURE' });
+      return { ...await sync(options), stopped: gate === 'mirror_stopped' };
+    };
+    let attempts = 0;
+    mirror.syncDeferredDetails = async () => { attempts++; return { detailPending: 0 }; };
+    engine.salesDetailsReady = true;
+    if (gate === 'incomplete_source') client.records.get('recLeadexisting').fields.负责人 = [{ id: 'invalid' }];
+    const result = await engine.scan({ apply: true, deferSalesDetails: true });
+    assert.equal(result.salesDetailsReady, false);
+    assert.deepEqual(await engine.syncDeferredSalesDetails(), {});
+    assert.equal(attempts, 0);
+  });
+}
+
 test('attachments stage only after a complete applied scan with a healthy roster', async t => {
   const { engine, client } = await fixture(t);
   let healthy = true;

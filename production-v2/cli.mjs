@@ -17,6 +17,10 @@ import { createAttachmentAclVerifier, createAttachmentRuntime, validateAttachmen
 import { orderReadinessReport } from './order-feishu-audit.mjs';
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
+export const MAX_SALES_DETAIL_DEFERRAL_MS = 30_000;
+const EVENT_FALLBACK_POLL_SECONDS = 30;
+const MAX_FULL_SCAN_PREEMPTIONS = 3;
+const MAX_FULL_SCAN_DEFERRAL_MS = 60_000;
 export function readConfig(root = ROOT) {
   const filename = path.join(root, 'config.workflow.local.json');
   if (!existsSync(filename)) fail('WORKFLOW_CONFIG_MISSING');
@@ -172,13 +176,14 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
   // This guard must run before opening a database, connecting WS, or calling an API.
   assertActivation(config, host);
   const lease = acquireLock(root); // Reuse v1's lock: v1 and v2 cannot run together on this host.
-  let engine, events, timer, watcher, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '';
-  let detailController = null, detailsAvailable = false, nextDetailsAt = 0, lastIdleTask = 'attachments';
+  let engine, events, timer, watcher, eventStart, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '', eventErrorCode = '', masterEventGeneration = 0;
+  let detailController = null, detailsAvailable = false, detailsPendingSince = null, nextDetailsAt = 0, lastIdleTask = 'attachments';
+  let fullScanPreemptions = 0, lastFullScanAt = Date.now();
   const wake = () => { dirty = true; detailController?.abort(); };
   const stop = () => { stopping = true; detailController?.abort(); };
   const shouldStop = () => { if (stopping) return true; try { if (stopRequested(lease)) stop(); } catch { stop(); } return stopping; };
   const snapshot = () => writeSnapshot(root, { kind: KIND, runnerVersion: 2, runnerRelease: WORKFLOW_RELEASE, ...lease.lock, checkedAt: new Date().toISOString(), phase,
-    connection: events?.status?.() || { state: 'polling' }, ...safeStatus(engine), lastErrorCode,
+    connection: { ...(events?.status?.() || { state: 'polling' }), ...(eventErrorCode ? { lastErrorCode: eventErrorCode } : {}) }, ...safeStatus(engine), lastErrorCode,
     nextScanAt: new Date(nextScan).toISOString(), enabled: true, notificationsEnabled: true });
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
@@ -189,31 +194,73 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
     const configStamp=()=>{const value=statSync(path.join(root,'config.workflow.local.json'));return `${value.mtimeMs}/${value.size}`;};
     let previousConfigStamp=configStamp();
     timer = setInterval(() => { try { snapshot(); } catch { stop(); } }, 5000);
-    watcher = setInterval(()=>{shouldStop();try{const current=configStamp();if(current!==previousConfigStamp){previousConfigStamp=current;wake();}}catch{stop();}},1000);
+    watcher = setInterval(()=>{
+      shouldStop();
+      if (config.events !== false && events.status().state !== 'connected') {
+        nextScan = Math.min(nextScan, Date.now() + EVENT_FALLBACK_POLL_SECONDS * 1000);
+        detailController?.abort();
+      }
+      try{const current=configStamp();if(current!==previousConfigStamp){previousConfigStamp=current;wake();}}catch{stop();}
+    },1000);
     while (!shouldStop()) {
       const state = events.status().state;
-      if (config.events !== false && !['connected','connecting','reconnecting'].includes(state) && Date.now() >= retryEventsAt) {
+      if (config.events !== false && !eventStart && !['connected','connecting','reconnecting'].includes(state) && Date.now() >= retryEventsAt) {
         retryEventsAt = Date.now() + 60000;
-        try { await events.stop(); await events.start(async event => { await engine.acceptEvent?.(event); wake(); }); }
-        catch (error) { lastErrorCode = safeCode(error); }
+        eventStart = (async () => {
+          await events.stop();
+          if (shouldStop()) return;
+          await events.start(async event => {
+            const accepted = await engine.acceptEvent?.(event);
+            const source = engine.config || config;
+            const master = event.appToken === source.appToken && event.tableId === source.tableIds?.leads;
+            const staff = source.staffManagement;
+            const roster = staff?.enabled && event.appToken === staff.appToken && event.tableId === staff.tableId;
+            if (accepted === false && (master || roster)) return;
+            if (accepted && master) masterEventGeneration++;
+            wake();
+          });
+          eventErrorCode = '';
+        })().catch(error => { eventErrorCode = safeCode(error); }).finally(() => { eventStart = null; });
       }
       if (shouldStop()) break;
       if (dirty || Date.now() >= nextScan) {
         dirty = false; detailsAvailable = false; phase = 'scanning'; snapshot();
         try {
-          const result = await engine.scan({ apply: true, shouldStop, deferSalesDetails: true });
-          detailsAvailable = result?.ok === true && !result.stopped && typeof engine.syncDeferredSalesDetails === 'function';
+          const beforeQuick = masterEventGeneration;
+          await engine.processPendingEvents?.({ shouldStop });
+          if (shouldStop()) break;
+          const fullRequired = fullScanPreemptions >= MAX_FULL_SCAN_PREEMPTIONS || Date.now() - lastFullScanAt >= MAX_FULL_SCAN_DEFERRAL_MS;
+          if (masterEventGeneration !== beforeQuick && !fullRequired && !shouldStop()) { fullScanPreemptions++; continue; }
+          dirty = false;
+          const scanGeneration = masterEventGeneration;
+          const result = await engine.scan({ apply: true,
+            shouldStop: () => shouldStop() || !fullRequired && masterEventGeneration !== scanGeneration, deferSalesDetails: true });
+          if (result?.stopped && !shouldStop()) fullScanPreemptions++;
+          else if (result?.ok === true && !result.stopped) { fullScanPreemptions = 0; lastFullScanAt = Date.now(); }
+          detailsAvailable = result?.salesDetailsReady === true && !result.stopped && typeof engine.syncDeferredSalesDetails === 'function';
+          if (detailsAvailable) detailsPendingSince ??= Date.now();
+          else detailsPendingSince = null;
           lastErrorCode = result?.ok === false ? safeCode(result.errors?.[0]) : '';
           const retry = result?.nextRetryAt ?? engine.status().nextRetryAt;
           const staffOnly=engine.status().staff?.healthy===true&&result?.errors?.length>0&&result.errors.every(error=>safeCode(error).startsWith('STAFF_'));
-          nextScan = nextScanTime({pollSeconds:config.pollSeconds||600,hasError:Boolean(lastErrorCode)&&!staffOnly,nextRetryAt:retry});
-        } catch (error) { lastErrorCode = safeCode(error); nextScan = Date.now() + 60000; }
+          const pollSeconds = config.events !== false && events.status().state !== 'connected'
+            ? Math.min(config.pollSeconds || 600, EVENT_FALLBACK_POLL_SECONDS) : config.pollSeconds || 600;
+          nextScan = nextScanTime({pollSeconds,hasError:Boolean(lastErrorCode)&&!staffOnly,nextRetryAt:retry});
+        } catch (error) {
+          lastErrorCode = safeCode(error);
+          const disconnected = config.events !== false && events.status().state !== 'connected';
+          nextScan = Date.now() + (disconnected ? EVENT_FALLBACK_POLL_SECONDS * 1000 : 60000);
+        }
         phase = lastErrorCode ? 'scan_error' : 'polling'; snapshot();
       }
       const now = Date.now();
       const attachmentDue = engine.attachmentDueAt?.();
-      const canRunDetails = detailsAvailable && now >= nextDetailsAt && nextScan - now > SALES_DETAIL_BUDGET_MS;
-      const canRunAttachments = Number.isSafeInteger(attachmentDue) && attachmentDue <= now && nextScan - now >= 20_000;
+      // Repeated compensation retries must eventually yield one bounded slice.
+      // Incoming events still abort that slice through wake().
+      const detailsOverdue = detailsPendingSince !== null && now - detailsPendingSince >= MAX_SALES_DETAIL_DEFERRAL_MS;
+      const canRunDetails = detailsAvailable && now >= nextDetailsAt && (nextScan - now > SALES_DETAIL_BUDGET_MS || detailsOverdue);
+      const canRunAttachments = (config.events === false || events.status().state === 'connected')
+        && Number.isSafeInteger(attachmentDue) && attachmentDue <= now && nextScan - now >= 20_000;
       if (!dirty && !shouldStop() && canRunAttachments && (!canRunDetails || lastIdleTask === 'details')) {
         detailController = new AbortController();
         lastIdleTask = 'attachments';
@@ -229,6 +276,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
         try {
           const detail = await engine.syncDeferredSalesDetails({ shouldStop, signal: detailController.signal });
           detailsAvailable = (detail?.detailPending || 0) > 0;
+          detailsPendingSince = detailsAvailable ? Date.now() : null;
           nextDetailsAt = Date.now() + (detail?.detailRateLimited ? 30_000 : 2000);
         } catch {
           detailsAvailable = false;
@@ -236,11 +284,11 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
           detailController = null;
         }
       }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (!dirty && !shouldStop()) await new Promise(resolve => setTimeout(resolve, 1000));
     }
   } finally {
     clearInterval(timer); clearInterval(watcher); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
-    try { await events?.stop(); } finally { try { if (engine) { phase = 'stopped'; snapshot(); await engine.close(); } } finally { lease.release(); } }
+    try { try { await events?.stop(); } finally { await eventStart; } } finally { try { if (engine) { phase = 'stopped'; snapshot(); await engine.close(); } } finally { lease.release(); } }
   }
 }
 export async function main(args = process.argv.slice(2)) {

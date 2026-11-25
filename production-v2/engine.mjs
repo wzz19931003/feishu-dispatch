@@ -46,6 +46,7 @@ export class WorkflowEngine {
   constructor({ config, client, dbPath, memberProvider, mirror, now = Date.now } = {}) {
     this.config = validateWorkflowConfig(config); this.client = client || new WorkflowClient(this.config);
     this.memberProvider = memberProvider; this.mirror = mirror || null; this.now = now; this.inFlight = null; this.closed = false;
+    this.salesDetailsReady = false;
     this.configSignature = stableConfig(this.config);
     const filename = dbPath || this.config.dbPath;
     if (filename !== ':memory:') mkdirSync(path.dirname(path.resolve(filename)), { recursive: true });
@@ -262,15 +263,63 @@ export class WorkflowEngine {
     this.inFlight = this.runScan(options).finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
+  processPendingEvents(options = {}) {
+    if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
+    if (this.inFlight) return Promise.reject(new WorkflowError('ENGINE_BUSY'));
+    this.inFlight = this.runPendingEvents(options).finally(() => { this.inFlight = null; });
+    return this.inFlight;
+  }
+  async runPendingEvents({ shouldStop = () => false } = {}) {
+    if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
+    if (!this.config.enabled) fail('WORKFLOW_DISABLED');
+    if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
+    const events = this.all('v2_inbox').filter(event => event.state === 'pending')
+      .sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)) || a.id.localeCompare(b.id));
+    const recordIds = [...new Set(events.flatMap(event => event.recordIds
+      .filter(id => !(event.processedRecordIds || []).includes(id) && !(event.retryAtByRecord?.[id] > this.now()))))].slice(0, 10);
+    if (!recordIds.length || stopped(shouldStop)) return { processed: 0, errors: [] };
+    const staff = await this.refreshStaff({ apply: true, shouldStop });
+    await this.refreshMembers();
+    const knownLegacy = new Set(this.meta('legacy_known_ids') || []), processed = [], failed = new Set(), reconcile = new Set(), errors = [...(staff.errors || [])];
+    for (const id of recordIds) {
+      if (stopped(shouldStop)) break;
+      try {
+        let view;
+        try { view = await this.readSource(id); }
+        catch (error) { if (!missingSource(error)) throw error; this.markMissing(id); }
+        if (view) {
+          this.observe(view, { baseline: !this.get('v2_snapshots', id) && knownLegacy.has(id) });
+          await this.processRecord(id, shouldStop);
+          await this.drain(shouldStop, task => task.recordId === id && task.state === 'pending' && task.attempts === 0);
+        }
+        if (!view?.owner || !this.config.members.some(member => member.openId === view.owner && member.target)) reconcile.add(id);
+        if (stopped(shouldStop)) break;
+        processed.push(id);
+      } catch (error) { failed.add(id); errors.push({ code: safeCode(error) }); }
+    }
+    for (const event of events) {
+      const processedRecordIds = [...new Set([...(event.processedRecordIds || []), ...processed.filter(id => event.recordIds.includes(id))])];
+      const failures = event.recordIds.filter(id => failed.has(id));
+      if (processedRecordIds.length === (event.processedRecordIds || []).length && !failures.length) continue;
+      const retryAtByRecord = Object.fromEntries(Object.entries(event.retryAtByRecord || {}).filter(([id]) => !processed.includes(id)));
+      for (const id of failures) retryAtByRecord[id] = this.now() + 30_000;
+      const done = event.recordIds.every(id => processedRecordIds.includes(id));
+      const requiresReconciliation = event.requiresReconciliation === true || event.recordIds.some(id => reconcile.has(id));
+      this.put('v2_inbox', { ...event, processedRecordIds, retryAtByRecord, requiresReconciliation,
+        state: done && !requiresReconciliation ? 'done' : 'pending', ...(done && !requiresReconciliation ? { processedAt: this.stamp() } : {}) });
+    }
+    return { processed: processed.length, errors, stopped: stopped(shouldStop) };
+  }
   syncDeferredSalesDetails(options = {}) {
     if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
     if (this.inFlight) return Promise.reject(new WorkflowError('ENGINE_BUSY'));
-    if (!this.config.enabled || !this.mirror?.syncDeferredDetails || options.shouldStop?.() || options.signal?.aborted) return Promise.resolve({});
+    if (!this.config.enabled || !this.salesDetailsReady || !this.mirror?.syncDeferredDetails || options.shouldStop?.() || options.signal?.aborted) return Promise.resolve({});
     this.inFlight = (async () => {
       const result = await this.mirror.syncDeferredDetails(options);
       const detail = Object.fromEntries(Object.entries(result || {}).filter(([key, value]) =>
         key.startsWith('detail') && Number.isSafeInteger(value) && value >= 0));
       if (Object.keys(detail).length) this.setMeta('mirror_status', { ...this.meta('mirror_status'), ...detail });
+      if (!detail.detailPending) this.salesDetailsReady = false;
       return detail;
     })().finally(() => { this.inFlight = null; });
     return this.inFlight;
@@ -310,7 +359,7 @@ export class WorkflowEngine {
     if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
-    if (apply) this.attachmentsReady = false;
+    if (apply) { this.attachmentsReady = false; this.salesDetailsReady = false; }
     const acknowledgedEvents = apply ? this.all('v2_inbox').filter(event => event.state === 'pending').map(event => event.id) : [];
     const acknowledgedStaffEvents=apply?this.staffEvents().filter(event=>event.state==='pending').map(event=>event.id):[];
     const staffResult=await this.refreshStaff({apply,shouldStop});
@@ -319,8 +368,11 @@ export class WorkflowEngine {
     // A rename during pagination must not turn an existing owner into an apparent blank.
     if (digest(resolved) !== digest(await this.resolveSource())) fail('SOURCE_SCHEMA_CHANGED_DURING_SCAN');
     const plans = [], sourceViews = [], errors = [...(staffResult.errors||[])], present = new Set(records.map(record => record.record_id));
+    let mirrorReconciled = false;
     const knownLegacy = new Set(this.meta('legacy_known_ids') || []);
-    for (const record of records) {
+    const eventRecordIds = new Set(this.all('v2_inbox').filter(event => event.state === 'pending').flatMap(event => event.recordIds));
+    const orderedRecords = [...records.filter(record => eventRecordIds.has(record.record_id)), ...records.filter(record => !eventRecordIds.has(record.record_id))];
+    for (const record of orderedRecords) {
       if (stopped(shouldStop)) break;
       try {
         const view = recordView(record, resolved); sourceViews.push(view); plans.push(this.preview(view));
@@ -328,6 +380,7 @@ export class WorkflowEngine {
         const old = this.get('v2_snapshots', view.id);
         this.observe(view, { baseline: !old && knownLegacy.has(view.id) });
         await this.processRecord(view.id, shouldStop);
+        await this.drain(shouldStop, task => task.recordId === view.id && task.state === 'pending' && task.attempts === 0);
       } catch (error) {
         errors.push({ code: safeCode(error) });
         if (apply) this.review(record.record_id, safeCode(error));
@@ -340,9 +393,13 @@ export class WorkflowEngine {
       if (this.mirror && !stopped(shouldStop)) {
         try {
           const result = await this.mirror.sync({ shouldStop, deferDetails: deferSalesDetails, sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
+          mirrorReconciled = !result?.stopped && !(result?.reviews > 0);
+          this.salesDetailsReady = deferSalesDetails && this.mirror.detailEnabled === true && !result?.stopped
+            && sourceViews.length === records.length && staffResult.healthy === true && !stopped(shouldStop);
           this.setMeta('mirror_status', Object.fromEntries(Object.entries(result || {}).filter(([, value]) => Number.isSafeInteger(value) && value >= 0)));
           if (result?.sourceWrites > 0 || result?.ensured > 0) this.setMeta('mirror_rescan_needed', true);
           if (result?.statusSources?.length && !stopped(shouldStop)) await this.notifyConfirmedMirrorStatuses(result.statusSources, shouldStop);
+          if (!result?.stopped && !stopped(shouldStop)) await this.releaseMirroredNotices(shouldStop);
         } catch (error) { if (safeCode(error) !== 'MIRROR_STOP_REQUESTED') { this.review('', safeCode(error), 'mirror_sync'); errors.push({ code: safeCode(error) }); } }
       }
       if (this.operatorMirror && staffResult.healthy === true && sourceViews.length === records.length && !stopped(shouldStop)) {
@@ -363,8 +420,18 @@ export class WorkflowEngine {
           }
         }
       }
-      for (const id of acknowledgedEvents) { const event = this.get('v2_inbox', id); if (event?.state === 'pending') this.put('v2_inbox', { ...event, state: 'done', processedAt: this.stamp() }); }
-      if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
+      if (!stopped(shouldStop)) {
+        for (const id of acknowledgedEvents) {
+          const event = this.get('v2_inbox', id);
+          if (event?.state !== 'pending') continue;
+          if (event.requiresReconciliation && !mirrorReconciled) {
+            this.put('v2_inbox', { ...event, reconciliationRetryAt: this.now() + 30_000 });
+            continue;
+          }
+          this.put('v2_inbox', { ...event, state: 'done', requiresReconciliation: false, processedAt: this.stamp() });
+        }
+        if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
+      }
       if (this.attachments && staffResult.healthy === true && !errors.length && sourceViews.length === records.length && !stopped(shouldStop)) {
         try {
           this.attachmentsReady = this.attachments.stageCore({ apply, healthy: true, complete: true, records }) === true;
@@ -376,8 +443,8 @@ export class WorkflowEngine {
     }
     const counts = {};
     for (const plan of plans) for (const action of plan.actions) counts[action] = (counts[action] || 0) + 1;
-    const result = { ok: errors.length === 0, apply, scanned: records.length, counts, errors, plans, stopped: stopped(shouldStop), needsRescan: Boolean(this.meta('mirror_rescan_needed')), nextRetryAt: this.nextRetryAt() };
-    if (apply) this.setMeta('last_scan', { at: this.stamp(), scanned: records.length, counts, errors: errors.map(error => error.code) });
+    const result = { ok: errors.length === 0, apply, scanned: records.length, counts, errors, plans, stopped: stopped(shouldStop), salesDetailsReady: apply && this.salesDetailsReady, needsRescan: Boolean(this.meta('mirror_rescan_needed')), nextRetryAt: this.nextRetryAt() };
+    if (apply && !result.stopped) this.setMeta('last_scan', { at: this.stamp(), scanned: records.length, counts, errors: errors.map(error => error.code) });
     return result;
   }
   assignmentDisplay(member, intent = null) {
@@ -526,8 +593,27 @@ export class WorkflowEngine {
   }
   async drain(shouldStop, select = () => true) {
     if (!this.config.notification.enabled) return;
-    const tasks = this.all('v2_outbox').filter(task => pending(task) && (!task.nextAttemptAt || task.nextAttemptAt <= this.now()) && select(task)).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id)).slice(0, 50);
+    const due = this.all('v2_outbox').filter(task => pending(task) && (!task.nextAttemptAt || task.nextAttemptAt <= this.now()) && select(task))
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id));
+    const firstAttempts = due.filter(task => task.state === 'pending' && task.attempts === 0).slice(0, 10);
+    const reserved = new Set(firstAttempts.map(task => task.id));
+    const tasks = [...firstAttempts, ...due.filter(task => !reserved.has(task.id)).slice(0, 50 - firstAttempts.length)];
     for (const task of tasks) { if (stopped(shouldStop)) break; await this.deliver(task.id, shouldStop); }
+  }
+  async releaseMirroredNotices(shouldStop) {
+    if (typeof this.mirror?.latest !== 'function' || stopped(shouldStop)) return;
+    const released = new Set();
+    for (const task of this.all('v2_outbox')) {
+      if (task.kind !== 'owner' || task.state !== 'waiting_mirror' || task.attempts !== 0 || task.delivery) continue;
+      const snapshot = this.get('v2_snapshots', task.recordId);
+      if (!this.taskCurrent(task, snapshot)) continue;
+      const member = this.config.members.find(member => member.openId === task.owner), mapping = this.mirror.latest(task.recordId);
+      if (!member?.target || mapping?.state !== 'active' || !mapping.targetRecordId || mapping.owner !== task.owner ||
+          mapping.memberId !== member.id || digest(mapping.target) !== digest(member.target)) continue;
+      this.put('v2_outbox', { ...task, state: 'pending', nextAttemptAt: 0 });
+      released.add(task.id);
+    }
+    if (released.size) await this.drain(shouldStop, task => released.has(task.id));
   }
   wait(task, state, code, retryMilliseconds = this.config.pollSeconds * 1000) {
     this.put('v2_outbox', { ...task, state, errorCode: code, nextAttemptAt: this.now() + retryMilliseconds });
@@ -616,7 +702,12 @@ export class WorkflowEngine {
   }
   nextRetryAt() {
     const due = [];
-    if (this.meta('mirror_rescan_needed') || this.all('v2_inbox').some(event => event.state === 'pending')) due.push(this.now() + 1000);
+    if (this.meta('mirror_rescan_needed')) due.push(this.now() + 1000);
+    for (const event of this.all('v2_inbox').filter(event => event.state === 'pending')) {
+      const remaining = event.recordIds.filter(id => !(event.processedRecordIds || []).includes(id));
+      if (!remaining.length) due.push(Math.max(this.now() + 1000, event.reconciliationRetryAt || 0));
+      for (const id of remaining) due.push(Math.max(this.now() + 1000, event.retryAtByRecord?.[id] || 0));
+    }
     const mirrorRetry = this.mirror?.status?.()?.nextRetryAt ?? this.meta('mirror_status')?.nextRetryAt;
     if (Number.isSafeInteger(mirrorRetry) && mirrorRetry > 0) due.push(mirrorRetry);
     const staffRetry=this.staff?.status?.()?.nextRetryAt;

@@ -299,6 +299,9 @@ test('sales contact is read by stable field ID and remains available for paused 
   f.client.change('A', { enabled: false }); await f.roster.refresh({ apply: true });
   assert.equal(byId(f.roster, 'sales_A').salesWechat, 'offline-updated-contact');
   assert.equal(byId(f.roster, 'sales_A').enabled, false);
+  const disabled = f.roster.registry().find(entry => entry.id === 'sales_A');
+  assert.equal(disabled.ready, true); assert.equal(disabled.state, 'disabled'); assert.equal(disabled.retired, false);
+  assert.deepEqual(disabled.target, f.cfg.members[0].target);
   f.client.change('A', { enabled: true });
   assert.equal((await f.roster.readCurrent('recStaffA')).version, version);
   const old = fixture(t); await old.roster.refresh(); assert.equal(byId(old.roster, 'sales_A').salesWechat, '');
