@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowClient } from './client.mjs';
-import { ROOT, KIND, ordinaryFile, acquireLock, writeSnapshot, stopRequested, safeCode, status, requestStop } from '../production/control.mjs';
+import { ROOT, KIND, ordinaryFile, acquireLock, writeSnapshot, stopRequested, safeCode, safeDetailStatus, status, requestStop } from '../production/control.mjs';
 import { validateWorkflowConfig, resolveFields } from './field-map.mjs';
 import { WorkflowEngine } from './engine.mjs';
 import { SalesMirror, boundedSalesDetailClient, SALES_DETAIL_BUDGET_MS } from './sales-mirror.mjs';
@@ -46,6 +46,7 @@ export function nextScanTime({now=Date.now(),pollSeconds=600,hasError=false,next
 }
 function safeStatus(engine) {
   const value = engine?.status?.() || {};
+  const salesDetails = safeDetailStatus(value.salesDetails);
   const counts = Object.fromEntries(Object.entries(value.counts || {}).filter(([key, n]) => /^[A-Za-z0-9_-]{1,80}$/.test(key) && Number.isSafeInteger(n) && n >= 0));
   if (Number.isSafeInteger(value.reviews)) counts.review_open = value.reviews;
   if (Number.isSafeInteger(value.eventsPending)) counts.events_pending = value.eventsPending;
@@ -58,7 +59,7 @@ function safeStatus(engine) {
   for (const [key, n] of Object.entries(value.attachments?.counts || {})) {
     if (/^[a-z_]{1,40}$/.test(key) && Number.isSafeInteger(n) && n >= 0) counts[`attachments_${key}`] = n;
   }
-  return { initialized: value.initialized === true, counts,
+  return { initialized: value.initialized === true, counts, ...(salesDetails ? { salesDetails } : {}),
     ...(value.staff?{staffHealthy:value.staff.healthy===true,staffErrors:(value.staff.errors||[]).map(error=>safeCode(typeof error==='string'?{code:error}:error))}:{}),
     ...(value.lastScan?.at ? { lastScan: { at: value.lastScan.at, scanned: value.lastScan.scanned ?? null } } : {}),
     ...(value.attachmentError ? { attachmentErrorCode: safeCode({ code: value.attachmentError }) } : {}),
@@ -129,6 +130,7 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
     }
     const clients = new Map([[config.appToken, client]]);
     engine.mirror = new Mirror({ config: engine.config, db: engine.db, sourceClient: client, ...salesDetails,
+      assertLiveConfig: () => engine.refreshMembers({ persist: false }),
       clientFactory: appToken => {
         if (!clients.has(appToken)) clients.set(appToken, new WorkflowClient({ ...engine.config, appToken }));
         return clients.get(appToken);
@@ -224,7 +226,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
       }
       if (shouldStop()) break;
       if (dirty || Date.now() >= nextScan) {
-        dirty = false; detailsAvailable = false; phase = 'scanning'; snapshot();
+        dirty = false; phase = 'scanning'; snapshot();
         try {
           const beforeQuick = masterEventGeneration;
           await engine.processPendingEvents?.({ shouldStop });
@@ -237,9 +239,12 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
             shouldStop: () => shouldStop() || !fullRequired && masterEventGeneration !== scanGeneration, deferSalesDetails: true });
           if (result?.stopped && !shouldStop()) fullScanPreemptions++;
           else if (result?.ok === true && !result.stopped) { fullScanPreemptions = 0; lastFullScanAt = Date.now(); }
-          detailsAvailable = result?.salesDetailsReady === true && !result.stopped && typeof engine.syncDeferredSalesDetails === 'function';
+          const detailState = engine.status();
+          detailsAvailable = (detailState.salesDetailsReady ?? result?.salesDetailsReady) === true && typeof engine.syncDeferredSalesDetails === 'function';
           if (detailsAvailable) detailsPendingSince ??= Date.now();
-          else detailsPendingSince = null;
+          if (detailState.salesDetails?.detailOldestPendingAt > 0) detailsPendingSince = detailState.salesDetails.detailOldestPendingAt;
+          if (detailState.salesDetails?.detailPending === 0) detailsPendingSince = null;
+          if (detailState.salesDetails?.detailNextAttemptAt > 0) nextDetailsAt = Math.min(nextDetailsAt, detailState.salesDetails.detailNextAttemptAt);
           lastErrorCode = result?.ok === false ? safeCode(result.errors?.[0]) : '';
           const retry = result?.nextRetryAt ?? engine.status().nextRetryAt;
           const staffOnly=engine.status().staff?.healthy===true&&result?.errors?.length>0&&result.errors.every(error=>safeCode(error).startsWith('STAFF_'));
@@ -248,6 +253,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
           nextScan = nextScanTime({pollSeconds,hasError:Boolean(lastErrorCode)&&!staffOnly,nextRetryAt:retry});
         } catch (error) {
           lastErrorCode = safeCode(error);
+          detailsAvailable = engine.status().salesDetailsReady === true;
           const disconnected = config.events !== false && events.status().state !== 'connected';
           nextScan = Date.now() + (disconnected ? EVENT_FALLBACK_POLL_SECONDS * 1000 : 60000);
         }
@@ -276,10 +282,12 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
         try {
           const detail = await engine.syncDeferredSalesDetails({ shouldStop, signal: detailController.signal });
           detailsAvailable = (detail?.detailPending || 0) > 0;
-          detailsPendingSince = detailsAvailable ? Date.now() : null;
-          nextDetailsAt = Date.now() + (detail?.detailRateLimited ? 30_000 : 2000);
+          if (detail?.detailOldestPendingAt > 0) detailsPendingSince = detail.detailOldestPendingAt;
+          else if (!detailsAvailable) detailsPendingSince = null;
+          nextDetailsAt = detail?.detailNextAttemptAt > Date.now() ? detail.detailNextAttemptAt : Date.now() + (detail?.detailRateLimited ? 30_000 : 2000);
         } catch {
-          detailsAvailable = false;
+          detailsAvailable = engine.status().salesDetailsReady === true;
+          nextDetailsAt = Date.now() + 30_000;
         } finally {
           detailController = null;
         }

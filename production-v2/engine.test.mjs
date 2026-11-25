@@ -227,6 +227,34 @@ test('a valid sales-details snapshot survives an unrelated operator-link failure
   assert.equal(engine.salesDetailsReady, false);
 });
 
+test('validated pending details and their diagnostics survive an interrupted full scan', async t => {
+  const { engine, mirror } = await fixture(t);
+  let healthy = true, attempts = 0;
+  engine.staff = { async refresh() { return { ok: healthy }; }, status() { return { healthy }; } };
+  mirror.detailEnabled = true;
+  mirror.hasPendingDetails = () => true;
+  mirror.detailStatus = () => ({ detailPending: 1, detailOldestPendingAt: 1_760_000_000_000, detailNextAttemptAt: 1_760_000_002_000 });
+  mirror.syncDeferredDetails = async () => {
+    attempts++;
+    return { ...mirror.detailStatus(), detailAttempts: 1, detailReviews: 1, detailLastAttemptAt: 1_760_000_000_000,
+      detailLastErrorCode: 'SALES_DETAIL_TIMEOUT', detailTimeouts: 1 };
+  };
+  assert.equal((await engine.scan({ apply: true, deferSalesDetails: true })).salesDetailsReady, true);
+  await engine.syncDeferredSalesDetails();
+  const saved = clone(engine.status().salesDetails);
+  assert.equal(saved.detailAttemptsTotal, 1); assert.equal(saved.detailLastErrorCode, 'SALES_DETAIL_TIMEOUT');
+  const interrupted = await engine.scan({ apply: true, deferSalesDetails: true, shouldStop: () => true });
+  assert.equal(interrupted.stopped, true); assert.equal(interrupted.salesDetailsReady, true);
+  assert.deepEqual(engine.status().salesDetails, saved);
+  await engine.scan({ apply: true, deferSalesDetails: true });
+  assert.equal(engine.status().mirror.detailAttemptsTotal, 1);
+  assert.equal(engine.status().mirror.detailLastErrorCode, 'SALES_DETAIL_TIMEOUT');
+  healthy = false;
+  await engine.scan({ apply: true, deferSalesDetails: true });
+  assert.equal(engine.status().salesDetailsReady, false);
+  assert.deepEqual(await engine.syncDeferredSalesDetails(), {}); assert.equal(attempts, 1);
+});
+
 test('real engine and sales mirror fill three historical private tables including a disabled salesperson', async t => {
   const config = upgradedFixtureConfig();
   delete config.fields.leads.account;

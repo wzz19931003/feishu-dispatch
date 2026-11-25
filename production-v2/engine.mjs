@@ -313,16 +313,27 @@ export class WorkflowEngine {
   syncDeferredSalesDetails(options = {}) {
     if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
     if (this.inFlight) return Promise.reject(new WorkflowError('ENGINE_BUSY'));
-    if (!this.config.enabled || !this.salesDetailsReady || !this.mirror?.syncDeferredDetails || options.shouldStop?.() || options.signal?.aborted) return Promise.resolve({});
+    if (!this.config.enabled || this.staffFailure || !this.salesDetailsReady || !this.mirror?.syncDeferredDetails || options.shouldStop?.() || options.signal?.aborted) return Promise.resolve({});
     this.inFlight = (async () => {
       const result = await this.mirror.syncDeferredDetails(options);
       const detail = Object.fromEntries(Object.entries(result || {}).filter(([key, value]) =>
         key.startsWith('detail') && Number.isSafeInteger(value) && value >= 0));
-      if (Object.keys(detail).length) this.setMeta('mirror_status', { ...this.meta('mirror_status'), ...detail });
+      this.rememberDetailStatus(result);
       if (!detail.detailPending) this.salesDetailsReady = false;
       return detail;
     })().finally(() => { this.inFlight = null; });
     return this.inFlight;
+  }
+  rememberDetailStatus(result) {
+    if (!result || !Object.keys(result).some(key => key.startsWith('detail'))) return;
+    const previous = this.meta('sales_detail_status') || {};
+    const status = { ...previous, ...Object.fromEntries(Object.entries(result).filter(([key, value]) =>
+      key.startsWith('detail') && Number.isSafeInteger(value) && value >= 0)) };
+    for (const key of ['detailAttempts', 'detailWrites', 'detailConfirmed', 'detailReviews', 'detailTimeouts', 'detailPreempted', 'detailRateLimited', 'detailWriteUnconfirmed']) {
+      if (Number.isSafeInteger(result[key]) && result[key] >= 0) status[`${key}Total`] = (previous[`${key}Total`] || 0) + result[key];
+    }
+    if (typeof result.detailLastErrorCode === 'string') status.detailLastErrorCode = /^[A-Z0-9_]{1,80}$/.test(result.detailLastErrorCode) ? result.detailLastErrorCode : '';
+    this.setMeta('sales_detail_status', status);
   }
   syncDeferredAttachments(options = {}) {
     if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
@@ -359,10 +370,11 @@ export class WorkflowEngine {
     if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
-    if (apply) { this.attachmentsReady = false; this.salesDetailsReady = false; }
+    if (apply) { this.attachmentsReady = false; if (!this.mirror?.hasPendingDetails) this.salesDetailsReady = false; }
     const acknowledgedEvents = apply ? this.all('v2_inbox').filter(event => event.state === 'pending').map(event => event.id) : [];
     const acknowledgedStaffEvents=apply?this.staffEvents().filter(event=>event.state==='pending').map(event=>event.id):[];
     const staffResult=await this.refreshStaff({apply,shouldStop});
+    if (staffResult.healthy === false) this.salesDetailsReady = false;
     await this.refreshMembers({ persist: apply });
     const resolved = await this.resolveSource(), records = await listAll(this.client, this.config.tableIds.leads);
     // A rename during pagination must not turn an existing owner into an apparent blank.
@@ -392,10 +404,14 @@ export class WorkflowEngine {
       await this.drain(shouldStop);
       if (this.mirror && !stopped(shouldStop)) {
         try {
-          const result = await this.mirror.sync({ shouldStop, deferDetails: deferSalesDetails, sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
+          const allowDetailsStaging = sourceViews.length === records.length && staffResult.healthy === true;
+          const result = await this.mirror.sync({ shouldStop, deferDetails: deferSalesDetails, allowDetailsStaging,
+            sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
           mirrorReconciled = !result?.stopped && !(result?.reviews > 0);
-          this.salesDetailsReady = deferSalesDetails && this.mirror.detailEnabled === true && !result?.stopped
-            && sourceViews.length === records.length && staffResult.healthy === true && !stopped(shouldStop);
+          const staged = deferSalesDetails && this.mirror.detailEnabled === true && !result?.stopped && allowDetailsStaging && !stopped(shouldStop);
+          if (staged) this.salesDetailsReady = true;
+          if (this.mirror.hasPendingDetails) this.salesDetailsReady = this.salesDetailsReady && this.mirror.hasPendingDetails();
+          this.rememberDetailStatus(this.mirror.detailStatus?.());
           this.setMeta('mirror_status', Object.fromEntries(Object.entries(result || {}).filter(([, value]) => Number.isSafeInteger(value) && value >= 0)));
           if (result?.sourceWrites > 0 || result?.ensured > 0) this.setMeta('mirror_rescan_needed', true);
           if (result?.statusSources?.length && !stopped(shouldStop)) await this.notifyConfirmedMirrorStatuses(result.statusSources, shouldStop);
@@ -729,7 +745,8 @@ export class WorkflowEngine {
     return { initialized: Boolean(this.meta('initialized')), busy: Boolean(this.inFlight), records, notifications, counts: { ...Object.fromEntries(Object.entries(records).map(([key, value]) => [`records_${key}`, value])), ...Object.fromEntries(Object.entries(notifications).map(([key, value]) => [`notifications_${key}`, value])) },
       reviews: this.all('v2_reviews').filter(review => review.state === 'open').length, eventsPending: this.all('v2_inbox').filter(event => event.state === 'pending').length,
       staffEventsPending:this.staffEvents().filter(event=>event.state==='pending').length,
-      nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: this.meta('mirror_status') || {},
+      nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: { ...this.meta('mirror_status'), ...this.meta('sales_detail_status') },
+      salesDetailsReady: this.salesDetailsReady && !this.staffFailure, salesDetails: this.meta('sales_detail_status') || {},
       operatorMirror: this.meta('operator_mirror_status') || {}, ...(this.staff?{staff:this.staff.status()}:{} ),
       ...(this.attachments ? { attachments: this.attachments.status() } : {}),
       ...(this.attachmentError ? { attachmentError: this.attachmentError } : {}) };

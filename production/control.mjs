@@ -7,6 +7,17 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const KIND = 'shiyeji-production-dispatch';
 export const filesFor = (root = ROOT) => ({ data: path.join(root, 'data'), lock: path.join(root, 'data/production.lock.json'), status: path.join(root, 'data/production.status.json'), stop: path.join(root, 'data/production.stop.json') });
 export function safeCode(error) { return typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'PRODUCTION_OPERATION_FAILED'; }
+export function safeDetailStatus(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const result = {};
+  for (const key of ['detailPending', 'detailOldestPendingAt', 'detailNextAttemptAt', 'detailLastAttemptAt', 'detailLastSuccessAt',
+    'detailAttempts', 'detailWrites', 'detailConfirmed', 'detailReviews', 'detailTimeouts', 'detailPreempted', 'detailRateLimited', 'detailWriteUnconfirmed',
+    'detailAttemptsTotal', 'detailWritesTotal', 'detailConfirmedTotal', 'detailReviewsTotal', 'detailTimeoutsTotal', 'detailPreemptedTotal', 'detailRateLimitedTotal', 'detailWriteUnconfirmedTotal']) {
+    if (Number.isSafeInteger(value[key]) && value[key] >= 0) result[key] = value[key];
+  }
+  if (typeof value.detailLastErrorCode === 'string' && (value.detailLastErrorCode === '' || /^[A-Z0-9_]{1,80}$/.test(value.detailLastErrorCode))) result.detailLastErrorCode = value.detailLastErrorCode;
+  return Object.keys(result).length ? result : undefined;
+}
 export function ordinaryFile(filename, max = 1024 * 1024) {
   const stat = lstatSync(filename);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > max) throw Object.assign(new Error('文件状态异常'), { code: 'UNSAFE_FILE' });
@@ -48,8 +59,9 @@ export function status(root = ROOT, { now = Date.now, alive = processState } = {
   const fresh = matching && Number.isFinite(age) && age >= -2000 && age < 20000;
   const staffStatus=matching&&typeof snapshot.staffHealthy==='boolean'?{staffHealthy:snapshot.staffHealthy,staffErrors:Array.isArray(snapshot.staffErrors)?snapshot.staffErrors.map(code=>safeCode({code})):[]}:{};
   const release=matching&&/^2\.\d+\.\d+$/.test(snapshot.runnerRelease||'')?{runnerRelease:snapshot.runnerRelease}:{};
+  const detailStatus = matching ? safeDetailStatus(snapshot.salesDetails) : undefined;
   return { kind: KIND, processStatus, running: processStatus === 'alive' && fresh, statusFresh: fresh, heartbeatAgeSeconds: Number.isFinite(age) ? Math.max(0, Math.round(age / 1000)) : null, pid: lock?.pid || null,
-    ...staffStatus,...release,
+    ...staffStatus,...release,...(detailStatus ? { salesDetails: detailStatus } : {}),
     ...(matching ? { phase: snapshot.phase, connection: snapshot.connection, initialized: snapshot.initialized, counts: snapshot.counts, lastScan: snapshot.lastScan, lastErrorCode: snapshot.lastErrorCode, nextScanAt: snapshot.nextScanAt, enabled: snapshot.enabled, notificationsEnabled: snapshot.notificationsEnabled } : { phase: lock ? 'unknown' : 'stopped' }) };
 }
 export function requestStop(root = ROOT) {

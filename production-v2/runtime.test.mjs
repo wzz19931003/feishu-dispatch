@@ -9,7 +9,7 @@ import { workflowConfig } from './test-fixtures.mjs';
 import { WorkflowEvents } from './events.mjs';
 import { createBackup } from './backup.mjs';
 import { restore } from './restore.mjs';
-import { requestStop } from '../production/control.mjs';
+import { requestStop, acquireLock, writeSnapshot, status, safeDetailStatus, KIND } from '../production/control.mjs';
 
 test('v2 rejects disabled or wrong-host activation before engine, network, or lock', async()=>{
   const root=mkdtempSync(path.join(tmpdir(),'shiyeji-v2-guard-'));let calls=0;
@@ -147,6 +147,49 @@ test('repeated one-second retries give three sales bounded turns without suppres
   await running;
   assert.equal(turns.length, 3);
   assert(scans > turns.length);
+});
+
+test('interrupted core passes cannot reset the age of already validated detail work', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-v2-persistent-detail-age-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(path.join(root, 'config.workflow.local.json'), '{}');
+  const initial = 1_760_000_000_000;
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: initial });
+  let scans = 0, details = 0, completed = false;
+  class FakeEvents { status() { return { state: 'connected' }; } async stop() {} }
+  const engine = {
+    status: () => ({ initialized: true, salesDetailsReady: true,
+      salesDetails: { detailPending: 1, detailOldestPendingAt: initial, detailNextAttemptAt: initial } }),
+    async scan() { scans++; return { ok: true, stopped: scans % 4 !== 1, salesDetailsReady: scans % 4 === 1, nextRetryAt: Date.now() }; },
+    async syncDeferredSalesDetails() {
+      details++;
+      assert(Date.now() - initial <= MAX_SALES_DETAIL_DEFERRAL_MS + 1000);
+      requestStop(root); return { detailPending: 0, detailOldestPendingAt: 0 };
+    }, async close() {},
+  };
+  const running = run({ enabled: true, notification: { enabled: true }, allowedHost: 'OFFLINE-FIXTURE', events: false },
+    { root, host: 'OFFLINE-FIXTURE', client: {}, Events: FakeEvents, makeEngine: async () => engine });
+  running.finally(() => { completed = true; }).catch(() => {});
+  for (let tick = 0; tick < 45 && !completed; tick++) { await new Promise(resolve => setImmediate(resolve)); t.mock.timers.tick(1000); }
+  if (!completed) { requestStop(root); t.mock.timers.tick(1000); }
+  await running;
+  assert.equal(details, 1); assert(scans > 4);
+});
+
+test('detail status exposes only fixed diagnostics and excludes raw record or customer values', t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-v2-safe-detail-status-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const lease = acquireLock(root);
+  try {
+    const value = { detailPending: 1, detailAttemptsTotal: 3, detailLastAttemptAt: 1_760_000_000_000,
+      detailLastErrorCode: 'SALES_DETAIL_TIMEOUT', recordId: 'recPrivateFixture', customerWechat: 'private-fixture-value', detailUnexpectedSecret: 123 };
+    writeSnapshot(root, { kind: KIND, ...lease.lock, checkedAt: new Date().toISOString(), salesDetails: value });
+    assert.deepEqual(status(root).salesDetails, { detailPending: 1, detailAttemptsTotal: 3,
+      detailLastAttemptAt: 1_760_000_000_000, detailLastErrorCode: 'SALES_DETAIL_TIMEOUT' });
+    assert.equal(JSON.stringify(status(root)).includes('private-fixture-value'), false);
+    assert.equal(safeDetailStatus({ detailPending: -1, detailLastErrorCode: 'unsafe error with private details' }), undefined);
+    assert.equal(safeDetailStatus({}), undefined);
+  } finally { lease.release(); }
 });
 
 test('a previously-ready salesperson who stops new work still passes the historical detail guard', async () => {

@@ -53,7 +53,7 @@ class FakeClient {
   }
 }
 
-function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails, detailBudgetMs } = {}) {
+function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails, detailBudgetMs, now } = {}) {
   const log = [], source = new FakeClient(sourceToken, 'tblSourceFixture001', schema('Source'), log);
   const childSchema = schema('Child').filter(field => !['owner', 'operator'].includes(field.key));
   const salesA = new FakeClient('SalesAFixtureBase012345', 'tblSalesAFixture001', childSchema, log);
@@ -81,7 +81,8 @@ function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailC
     const record = await source.readRecord(source.table, id); return recordView(record, await resolveSource());
   };
   const db = new DatabaseSync(filename), clients = new Map([source, salesA, salesB].map(client => [client.base, client]));
-  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource, detailBudgetMs,
+  const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource, detailBudgetMs, now,
+    assertLiveConfig: () => hooks.assertLiveConfig?.(),
     operatorNames: () => hooks.staffUnhealthy ? null : new Map([['ou_fixture_operator', '离线运营']]),
     auditDetailsTarget: async (member, stopped, signal) => hooks.auditDetailsTarget?.(member, stopped, signal) ?? true });
   const mirror = construct();
@@ -163,7 +164,8 @@ test('sales detail backfill keeps existing record, corrects personal edits and n
 });
 
 test('sales details require both columns and current access before first pin, and stop if ownership or field IDs change', async () => {
-  const f = fixture({ detailColumns: true });
+  let tick = Date.now();
+  const f = fixture({ detailColumns: true, now: () => tick });
   try {
     const source = f.source.records.get('recSource1');
     source.fields['日期'] = 1_760_000_000_000;
@@ -173,6 +175,7 @@ test('sales details require both columns and current access before first pin, an
     assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
     assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM v2_sales_detail_pins').get().count, 0);
     f.hooks.auditDetailsTarget = () => true;
+    tick += 2000;
     f.salesA.hooks.beforeRead = () => owner(f, 'ou_fixture_sales_b');
     assert.equal((await f.mirror.sync()).detailWrites, 0);
     assert.equal(f.salesA.records.get(assignment.targetRecordId).fields['日期'], undefined);
@@ -225,9 +228,161 @@ test('deferred sales details attempt one row per slice and recheck the whitelist
     assert.equal(first.detailPending, 2);
     const denied = await f.mirror.syncDeferredDetails();
     assert.equal(denied.detailWrites, 0);
-    assert.equal(denied.detailPending, 1);
+    assert.equal(denied.detailPending, 2);
     assert.equal(audits, 2);
     assert.equal([...f.salesA.records.values()].filter(record => record.fields['日期']).length, 1);
+  } finally { f.close(); }
+});
+
+test('a single failed detail stays pending and retries without another full scan', async () => {
+  let tick = 1_760_000_000_000;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    f.source.records.get('recSource1').fields.日期 = tick;
+    const target = await f.mirror.ensure({ id: 'recSource1' });
+    await f.mirror.sync({ deferDetails: true });
+    f.hooks.auditDetailsTarget = () => false;
+    const denied = await f.mirror.syncDeferredDetails();
+    assert.equal(denied.detailPending, 1); assert.equal(denied.detailWrites, 0);
+    assert.equal(denied.detailLastErrorCode, 'SALES_DETAIL_ACCESS_UNVERIFIED');
+    const reads = f.source.metrics.read;
+    f.hooks.auditDetailsTarget = () => true;
+    assert.equal((await f.mirror.syncDeferredDetails()).detailAttempts, 0);
+    assert.equal(f.source.metrics.read, reads);
+    tick = denied.detailNextAttemptAt;
+    const retry = await f.mirror.syncDeferredDetails();
+    assert.equal(retry.detailWrites, 1); assert.equal(retry.detailConfirmed, 1); assert.equal(retry.detailPending, 0);
+    assert.equal(f.salesA.records.get(target.targetRecordId).fields.日期, 1_760_000_000_000);
+    assert.equal(f.mirror.latest('recSource1').detailJob.pending, false);
+    assert.equal(createCount(f), 1);
+  } finally { f.close(); }
+});
+
+test('detail retries rotate past one denied row and keep durable age across a replaced core snapshot', async () => {
+  let tick = 1_760_000_000_000;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    const first = f.source.records.get('recSource1'); first.fields.日期 = tick;
+    f.source.records.set('recSource2', { ...clone(first), record_id: 'recSource2', fields: { ...clone(first.fields), Owner: [{ id: 'ou_fixture_sales_b' }] } });
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.ensure({ id: 'recSource2' });
+    await f.mirror.sync({ deferDetails: true });
+    f.hooks.auditDetailsTarget = member => member.id !== 'sales_a';
+    const denied = await f.mirror.syncDeferredDetails(); assert.equal(denied.detailPending, 2);
+    const since = denied.detailOldestPendingAt;
+    const second = await f.mirror.syncDeferredDetails(); assert.equal(second.detailWrites, 1); assert.equal(second.detailPending, 1);
+    await assert.rejects(f.mirror.sync({ deferDetails: true, shouldStop: () => true }), { code: 'MIRROR_STOP_REQUESTED' });
+    assert.equal(f.mirror.hasPendingDetails(), true);
+    tick += 1000; await f.mirror.sync({ deferDetails: true });
+    assert.equal(f.mirror.detailStatus().detailOldestPendingAt, since);
+    assert.equal((await f.mirror.syncDeferredDetails()).detailAttempts, 0);
+    f.hooks.auditDetailsTarget = () => true; tick = f.mirror.detailStatus().detailNextAttemptAt;
+    assert.equal((await f.mirror.syncDeferredDetails()).detailWrites, 1);
+  } finally { f.close(); }
+});
+
+test('an unknown detail PUT is confirmed by GET without repeating the write', async () => {
+  let tick = 1_760_000_000_000;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    f.source.records.get('recSource1').fields.日期 = tick;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    f.salesA.hooks.afterUpdate = () => { throw Object.assign(new Error('offline lost response'), { code: 'NETWORK_OR_TIMEOUT' }); };
+    const unknown = await f.mirror.syncDeferredDetails();
+    assert.equal(unknown.detailWriteUnconfirmed, 1); assert.equal(unknown.detailPending, 1);
+    const updates = () => f.log.filter(entry => entry.op === 'update' && entry.base === f.salesA.base).length;
+    assert.equal(updates(), 1);
+    delete f.salesA.hooks.afterUpdate; tick = unknown.detailNextAttemptAt;
+    const confirmed = await f.mirror.syncDeferredDetails();
+    assert.equal(confirmed.detailWrites, 0); assert.equal(confirmed.detailConfirmed, 1); assert.equal(confirmed.detailPending, 0);
+    assert.equal(updates(), 1); assert.equal(f.mirror.latest('recSource1').detailJob.writeUnconfirmed, false);
+  } finally { f.close(); }
+});
+
+test('a detail PUT response with no confirmed values is held for a later read', async () => {
+  let tick = 1_760_000_000_000;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    f.source.records.get('recSource1').fields.日期 = tick;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    const update = f.salesA.updateRecord;
+    f.salesA.updateRecord = async function (...args) { const response = await update.apply(this, args); return { record_id: response.record_id, fields: {} }; };
+    const first = await f.mirror.syncDeferredDetails();
+    assert.equal(first.detailPending, 1); assert.equal(first.detailWriteUnconfirmed, 1); assert.equal(first.detailConfirmed, 0);
+    tick = first.detailNextAttemptAt;
+    assert.equal((await f.mirror.syncDeferredDetails()).detailConfirmed, 1);
+    assert.equal(f.log.filter(entry => entry.op === 'update' && entry.base === f.salesA.base).length, 1);
+  } finally { f.close(); }
+});
+
+test('a detail owner change during ACL checking prevents the target PUT', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    f.source.records.get('recSource1').fields.日期 = 1_760_000_000_000;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    f.log.length = 0;
+    f.hooks.auditDetailsTarget = () => { owner(f, 'ou_fixture_sales_b'); return true; };
+    const result = await f.mirror.syncDeferredDetails();
+    assert.equal(result.detailWrites, 0); assert.equal(result.detailPending, 0);
+    assert.equal(result.detailLastErrorCode, 'SALES_DETAIL_OWNER_CHANGED');
+    assert.equal(f.log.some(entry => entry.op === 'update'), false);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM v2_sales_detail_pins').get().n, 0);
+  } finally { f.close(); }
+});
+
+test('a local activation change after final source reads prevents the scalar PUT and first pin', async () => {
+  const f = fixture({ detailColumns: true });
+  try {
+    f.source.records.get('recSource1').fields.日期 = 1_760_000_000_000;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    f.hooks.assertLiveConfig = () => { throw Object.assign(new Error('offline switch changed'), { code: 'LIVE_CONFIG_BINDING_CHANGED' }); };
+    f.log.length = 0;
+    const result = await f.mirror.syncDeferredDetails();
+    assert.equal(result.detailWrites, 0); assert.equal(result.detailPending, 1);
+    assert.equal(result.detailLastErrorCode, 'LIVE_CONFIG_BINDING_CHANGED');
+    assert.equal(f.log.some(entry => entry.op === 'update'), false);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM v2_sales_detail_pins').get().n, 0);
+  } finally { f.close(); }
+});
+
+test('a final source rename with old-name reuse holds the retry until a fresh complete schema', async () => {
+  let tick = 1_760_000_000_000, reads = 0;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    f.source.records.get('recSource1').fields.日期 = tick;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    f.source.hooks.beforeRead = () => {
+      if (++reads !== 2) return;
+      f.source.schema.find(field => field.key === 'leadDate').field_name = '新日期';
+      f.source.schema.push({ field_id: 'fldUnrelatedDate000', field_name: '日期', type: 5 });
+      const fields = f.source.records.get('recSource1').fields;
+      fields.新日期 = fields.日期; fields.日期 = 1_790_000_000_000;
+    };
+    const held = await f.mirror.syncDeferredDetails();
+    assert.equal(held.detailWrites, 0); assert.equal(held.detailPending, 1);
+    assert.equal(held.detailLastErrorCode, 'SALES_DETAIL_SOURCE_SCHEMA_CHANGED');
+    delete f.source.hooks.beforeRead;
+    tick = held.detailNextAttemptAt; await f.mirror.sync({ deferDetails: true });
+    assert.equal((await f.mirror.syncDeferredDetails()).detailWrites, 1);
+    assert.equal([...f.salesA.records.values()][0].fields.日期, 1_760_000_000_000);
+    assert.equal(f.source.records.get('recSource1').fields.日期, 1_790_000_000_000);
+  } finally { f.close(); }
+});
+
+test('scalar rate limits survive new core stages and a reconstructed mirror without a tight retry loop', async () => {
+  let tick = 1_760_000_000_000;
+  const f = fixture({ detailColumns: true, now: () => tick });
+  try {
+    f.source.records.get('recSource1').fields.日期 = tick;
+    await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync({ deferDetails: true });
+    let audits = 0;
+    f.hooks.auditDetailsTarget = () => { audits++; throw Object.assign(new Error('offline limit'), { code: 'SALES_DETAILS_RATE_LIMIT' }); };
+    const limited = await f.mirror.syncDeferredDetails();
+    assert.equal(limited.detailRateLimited, 1); assert.equal(limited.detailPending, 1);
+    assert(limited.detailNextAttemptAt >= tick + 30_000);
+    const rebuilt = f.construct(); tick += 1000; await rebuilt.sync({ deferDetails: true });
+    assert.equal((await rebuilt.syncDeferredDetails()).detailAttempts, 0); assert.equal(audits, 1);
+    f.hooks.auditDetailsTarget = () => true; tick = limited.detailNextAttemptAt;
+    assert.equal((await rebuilt.syncDeferredDetails()).detailWrites, 1);
   } finally { f.close(); }
 });
 

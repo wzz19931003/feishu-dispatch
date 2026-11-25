@@ -70,16 +70,18 @@ async function records(client, target) {
 /** Uses only its own tables in the caller-owned SQLite connection. */
 export class SalesMirror {
   constructor({ config, db, sourceClient, clientFactory, readSource, resolveSource, operatorNames, auditDetailsTarget,
-    detailBudgetMs = SALES_DETAIL_BUDGET_MS, now = Date.now } = {}) {
+    assertLiveConfig = async () => {}, detailBudgetMs = SALES_DETAIL_BUDGET_MS, now = Date.now } = {}) {
     if (!config || !db?.prepare || !sourceClient || typeof clientFactory !== 'function' || typeof readSource !== 'function' || typeof resolveSource !== 'function') fail('MIRROR_ARGUMENTS_REQUIRED');
     this.config = config; this.db = db; this.sourceClient = sourceClient; this.clientFactory = clientFactory; this.readSource = readSource; this.resolveSource = resolveSource; this.busy = false;
     this.now = now; this.sourceMutationCount = 0;
     this.operatorNames = operatorNames;
     this.auditDetailsTarget = auditDetailsTarget;
+    this.assertLiveConfig = assertLiveConfig;
     this.detailEnabled = config.staffManagement?.enabled === true && config.mirrors?.salesDetails !== false
       && Boolean(config.fields?.leads?.leadDate);
     this.detailBudgetMs = detailBudgetMs;
     this.detailCursor = '';
+    this.detailCooldownUntil = 0;
     this.deferredDetails = null;
     const feedback = config.mirrors?.feedbackFields || ['wxStatus'];
     if (!Array.isArray(feedback) || !feedback.includes('wxStatus') || feedback.some(key => !FEEDBACK_FIELDS.has(key)) || new Set(feedback).size !== feedback.length) fail('MIRROR_FEEDBACK_INVALID');
@@ -87,6 +89,7 @@ export class SalesMirror {
     db.exec('CREATE TABLE IF NOT EXISTS v2_mirrors (id TEXT PRIMARY KEY,source_id TEXT NOT NULL,version INTEGER NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL); CREATE INDEX IF NOT EXISTS v2_mirrors_source ON v2_mirrors(source_id,version); CREATE TABLE IF NOT EXISTS v2_mirror_reviews (id TEXT PRIMARY KEY,data TEXT NOT NULL);');
     if (this.detailEnabled) db.exec('CREATE TABLE IF NOT EXISTS v2_sales_detail_pins (target TEXT PRIMARY KEY, date_id TEXT NOT NULL, operator_name_id TEXT NOT NULL);');
     for (const row of this.rows()) if (row.sourceAppToken !== config.appToken || row.sourceTableId !== config.tableIds.leads) fail('MIRROR_DATABASE_BINDING_MISMATCH');
+    for (const row of this.rows()) if (SALES_DETAIL_LIMIT_CODES.has(row.detailJob?.lastErrorCode) && Number.isSafeInteger(row.detailJob?.nextAttemptAt)) this.detailCooldownUntil = Math.max(this.detailCooldownUntil, row.detailJob.nextAttemptAt);
     // An interrupted create can already have succeeded remotely. Do not POST again.
     for (const row of this.rows()) if (row.state === 'creating') {
       this.put({ ...row, state: 'create_review', errorCode: 'MIRROR_CREATE_OUTCOME_UNKNOWN' });
@@ -144,6 +147,31 @@ export class SalesMirror {
     for (const key of COPY_FIELDS) if (resolved[key] && (key === 'salesName' || this.config.fields?.leads?.[key])) result[key] = key === 'salesName' ? member.displayName : view[key] ?? (resolved[key].type === 2 ? null : '');
     return result;
   }
+  saveDetailJob(id, changes) {
+    const stored = this.db.prepare('SELECT data FROM v2_mirrors WHERE id=?').get(id);
+    if (!stored) return null;
+    const current = JSON.parse(stored.data);
+    return this.put({ ...current, detailJob: { ...current.detailJob, ...changes } });
+  }
+  detailStatus() {
+    const jobs = this.rows().filter(row => row.state === 'active' && row.detailJob?.pending).map(row => row.detailJob);
+    return { detailPending: jobs.length,
+      detailOldestPendingAt: jobs.length ? Math.min(...jobs.map(job => job.pendingSince)) : 0,
+      detailNextAttemptAt: jobs.length ? Math.max(this.detailCooldownUntil, Math.min(...jobs.map(job => job.nextAttemptAt || this.now()))) : 0 };
+  }
+  hasPendingDetails() { return Boolean(this.deferredDetails?.work?.candidates.length); }
+  stageDetails(work) {
+    if (!(work.names instanceof Map)) return;
+    const candidates = new Map(work.candidates.map(candidate => [candidate.row.id, candidate]));
+    for (const candidate of this.deferredDetails?.work?.candidates || []) {
+      const current = this.latest(candidate.row.sourceId);
+      if (current?.state === 'active' && current.id === candidate.row.id && current.detailJob?.pending && !candidates.has(current.id)) {
+        candidates.set(current.id, { ...candidate, row: current });
+      }
+    }
+    work.candidates = [...candidates.values()];
+    this.deferredDetails = work.candidates.length ? { work } : null;
+  }
   detailFields(member, schema) {
     const { target } = member;
     const requiredIds = new Set(Object.values(target.fields).map(spec => spec.fieldId));
@@ -196,7 +224,12 @@ export class SalesMirror {
       try {
         const targetView = recordView(record, fields);
         const values = this.detailValues(view, fields, names);
-        if (Object.entries(values).some(([logical, value]) => !equal(targetView[logical], value))) candidates.push({ row, member, fields });
+        if (row.detailJob?.pending || Object.entries(values).some(([logical, value]) => !equal(targetView[logical], value))) {
+          const queued = row.detailJob?.pending ? row : this.saveDetailJob(row.id, {
+            pending: true, pendingSince: this.now(), nextAttemptAt: 0, attempts: 0, lastErrorCode: '', writeUnconfirmed: false,
+          });
+          candidates.push({ row: queued, member, fields });
+        }
       } catch { work.reviews++; }
     }
     candidates.sort((a, b) => a.row.sourceId < b.row.sourceId ? -1 : a.row.sourceId > b.row.sourceId ? 1 : 0);
@@ -206,64 +239,113 @@ export class SalesMirror {
     return work;
   }
   async attemptDetails(work, { shouldStop, signal } = {}) {
-    const counts = { detailWrites: 0, detailReviews: work.reviews, detailFieldsReady: 0, detailAttempts: 0,
+    const counts = { detailWrites: 0, detailReviews: work.reviews, detailFieldsReady: 0, detailAttempts: 0, detailConfirmed: 0,
       detailPending: work.candidates.length, detailTimeouts: 0, detailPreempted: 0, detailRateLimited: 0,
       detailWriteUnconfirmed: 0 };
     work.reviews = 0;
     if (!work.candidates.length || stopped(shouldStop) || signal?.aborted) return counts;
+    const due = work.candidates.findIndex(candidate => Math.max(candidate.row.detailJob?.nextAttemptAt || 0, this.detailCooldownUntil) <= this.now());
+    if (due < 0) return { ...counts, ...this.detailStatus() };
     const timer = AbortSignal.timeout(this.detailBudgetMs);
     const limited = new AbortController();
     const deadline = AbortSignal.any([timer, limited.signal, ...(signal ? [signal] : [])]);
     const budgetEnded = () => stopped(shouldStop) || deadline.aborted;
     const abortOnLimit = () => { counts.detailRateLimited = 1; limited.abort(); };
-    const { row, member, fields } = work.candidates.shift();
-    const { sourceResolved, names } = work;
-    counts.detailPending = work.candidates.length;
+    const candidate = work.candidates.splice(due, 1)[0];
+    const { row, fields } = candidate;
+    const { sourceResolved } = work;
     counts.detailAttempts = 1;
-    const key = targetIdentity(member.target);
+    counts.detailLastAttemptAt = this.now();
+    const key = targetIdentity(candidate.member.target);
     const boundedSource = boundedSalesDetailClient(this.sourceClient, deadline);
-    const targetClient = boundedSalesDetailClient(this.clientFactory(member.target.appToken), deadline);
+    const targetClient = boundedSalesDetailClient(this.clientFactory(candidate.member.target.appToken), deadline);
     const sourceTarget = { appToken: this.config.appToken, tableId: this.config.tableIds.leads, fields: this.config.fields.leads };
-    let writeIssued = false;
+    let writeIssued = false, confirmed = false, cancelled = false, errorCode = '';
     try {
       this.detailCursor = row.sourceId;
+      const active = this.latest(row.sourceId);
+      if (active?.state !== 'active' || active.id !== row.id || active.targetRecordId !== row.targetRecordId) {
+        cancelled = true; errorCode = 'SALES_DETAIL_MAPPING_CHANGED'; return counts;
+      }
+      const member = this.member(row.owner), names = this.operatorNames?.();
+      if (!(names instanceof Map)) fail('SALES_DETAIL_ROSTER_NOT_READY');
+      if (targetIdentity(member.target) !== key) { cancelled = true; errorCode = 'SALES_DETAIL_MAPPING_CHANGED'; return counts; }
       const [record, current] = await detailReads([
         this.targetRecord(row, targetClient),
         boundedSource.readRecord(this.config.tableIds.leads, row.sourceId),
       ], abortOnLimit);
-      if (budgetEnded() || !record) return counts;
+      if (budgetEnded()) return counts;
+      if (!record) { cancelled = true; errorCode = 'SALES_DETAIL_TARGET_MISSING'; return counts; }
       const fresh = recordView(current, sourceResolved);
-      if (fresh.id !== row.sourceId || fresh.owner !== row.owner) return counts;
       const [verifiedSource, schema, access] = await detailReads([
         resolveFields(boundedSource, sourceTarget),
         listFieldMetadata(targetClient, member.target),
         this.auditDetailsTarget(member, budgetEnded, deadline),
       ], abortOnLimit);
       if (budgetEnded()) return counts;
-      if (access !== true || fingerprint(sourceResolved) !== fingerprint(verifiedSource)) { counts.detailReviews++; return counts; }
+      if (access !== true) fail('SALES_DETAIL_ACCESS_UNVERIFIED');
+      if (fingerprint(sourceResolved) !== fingerprint(verifiedSource)) fail('SALES_DETAIL_SOURCE_SCHEMA_CHANGED');
+      if (fresh.id !== row.sourceId || fresh.owner !== row.owner) { cancelled = true; errorCode = 'SALES_DETAIL_OWNER_CHANGED'; return counts; }
       counts.detailFieldsReady = 2;
       const atWrite = this.detailFields(member, schema);
-      if (fingerprint(atWrite) !== fingerprint(fields)) { counts.detailReviews++; return counts; }
+      if (fingerprint(atWrite) !== fingerprint(fields)) fail('SALES_DETAIL_TARGET_SCHEMA_CHANGED');
       const targetView = recordView(record, atWrite);
-      const values = this.detailValues(fresh, atWrite, names);
-      const patch = Object.fromEntries(Object.entries(values).filter(([logical, value]) => !equal(targetView[logical], value)));
-      if (!Object.keys(patch).length || budgetEnded()) return counts;
+      let values = this.detailValues(fresh, atWrite, names);
+      let patch = Object.fromEntries(Object.entries(values).filter(([logical, value]) => !equal(targetView[logical], value)));
+      if (budgetEnded()) return counts;
+      if (!Object.keys(patch).length) { confirmed = true; counts.detailConfirmed = 1; return counts; }
+      const finalRecord = await boundedSource.readRecord(this.config.tableIds.leads, row.sourceId);
+      const [finalSourceFields, finalTargetSchema] = await detailReads([
+        resolveFields(boundedSource, sourceTarget), listFieldMetadata(targetClient, member.target),
+      ], abortOnLimit);
+      if (budgetEnded()) return counts;
+      if (fingerprint(finalSourceFields) !== fingerprint(sourceResolved)) fail('SALES_DETAIL_SOURCE_SCHEMA_CHANGED');
+      if (fingerprint(this.detailFields(member, finalTargetSchema)) !== fingerprint(atWrite)) fail('SALES_DETAIL_TARGET_SCHEMA_CHANGED');
+      const final = recordView(finalRecord, finalSourceFields);
+      if (final.id !== row.sourceId || final.owner !== row.owner) { cancelled = true; errorCode = 'SALES_DETAIL_OWNER_CHANGED'; return counts; }
+      values = this.detailValues(final, atWrite, names);
+      patch = Object.fromEntries(Object.entries(values).filter(([logical, value]) => !equal(targetView[logical], value)));
+      if (!Object.keys(patch).length) { confirmed = true; counts.detailConfirmed = 1; return counts; }
       const pinned = this.latest(row.sourceId);
-      if (pinned?.state !== 'active' || pinned.id !== row.id || pinned.targetRecordId !== row.targetRecordId) return counts;
+      if (pinned?.state !== 'active' || pinned.id !== row.id || pinned.targetRecordId !== row.targetRecordId) {
+        cancelled = true; errorCode = 'SALES_DETAIL_MAPPING_CHANGED'; return counts;
+      }
+      await this.assertLiveConfig();
+      if (budgetEnded()) return counts;
       this.checkWrite(shouldStop);
       const encoded = encodePatch(patch, atWrite);
       this.db.prepare('INSERT OR IGNORE INTO v2_sales_detail_pins(target,date_id,operator_name_id) VALUES(?,?,?)')
         .run(key, atWrite.leadDate.fieldId, atWrite.operatorName.fieldId);
       writeIssued = true;
-      await targetClient.updateRecord(row.target.tableId, row.targetRecordId, encoded);
+      const response = await targetClient.updateRecord(row.target.tableId, row.targetRecordId, encoded);
       counts.detailWrites = 1;
+      const returned = recordView(response, atWrite);
+      if (returned.id !== row.targetRecordId || Object.entries(values).some(([logical, value]) => !equal(returned[logical], value))) fail('SALES_DETAIL_UPDATE_UNCONFIRMED');
+      confirmed = true; counts.detailConfirmed = 1;
     } catch (error) {
+      errorCode = safeCode(error);
+      if (absent(error)) cancelled = true;
       if (SALES_DETAIL_LIMIT_CODES.has(safeCode(error))) counts.detailRateLimited = 1;
-      if (writeIssued && deadline.aborted) counts.detailWriteUnconfirmed = 1;
+      if (writeIssued) counts.detailWriteUnconfirmed = 1;
       if (!timer.aborted && !signal?.aborted) counts.detailReviews++;
     } finally {
       if (timer.aborted) counts.detailTimeouts = 1;
       if (signal?.aborted) counts.detailPreempted = 1;
+      if (!confirmed && !cancelled) {
+        errorCode ||= timer.aborted ? 'SALES_DETAIL_TIMEOUT' : signal?.aborted ? 'SALES_DETAIL_PREEMPTED' : 'SALES_DETAIL_RETRY_REQUIRED';
+        const attempts = (row.detailJob?.attempts || 0) + 1;
+        const delay = Math.max(counts.detailRateLimited ? 30_000 : 2000, Math.min(300_000, 2000 * 2 ** Math.min(attempts - 1, 8)));
+        if (counts.detailRateLimited) this.detailCooldownUntil = Math.max(this.detailCooldownUntil, this.now() + delay);
+        candidate.row = this.saveDetailJob(row.id, { pending: true, attempts, nextAttemptAt: this.now() + delay,
+          lastAttemptAt: counts.detailLastAttemptAt, lastErrorCode: errorCode, writeUnconfirmed: writeIssued || row.detailJob?.writeUnconfirmed === true });
+        if (candidate.row) work.candidates.push(candidate);
+      } else {
+        this.saveDetailJob(row.id, { pending: false, nextAttemptAt: 0, lastAttemptAt: counts.detailLastAttemptAt,
+          lastErrorCode: errorCode, writeUnconfirmed: false, ...(confirmed ? { lastSuccessAt: this.now() } : {}) });
+      }
+      if (confirmed) counts.detailLastSuccessAt = this.now();
+      counts.detailLastErrorCode = errorCode;
+      Object.assign(counts, this.detailStatus());
     }
     return counts;
   }
@@ -271,7 +353,6 @@ export class SalesMirror {
     return this.exclusive(async () => {
       const deferred = this.deferredDetails;
       if (!deferred) return {};
-      deferred.work ??= this.prepareDetails(deferred.views, deferred.childSnapshots, deferred.sourceResolved, shouldStop);
       const result = await this.attemptDetails(deferred.work, { shouldStop, signal });
       if (!result.detailPending) this.deferredDetails = null;
       return result;
@@ -436,9 +517,8 @@ export class SalesMirror {
     fail('MIRROR_OWNERSHIP_UNSTABLE');
   }
   ensure(view, options = {}) { return this.exclusive(() => this.ensureInternal(view, options)); }
-  sync({ shouldStop = () => false, sourceViews, deferDetails = false } = {}) {
+  sync({ shouldStop = () => false, sourceViews, deferDetails = false, allowDetailsStaging = true } = {}) {
     return this.exclusive(async () => {
-      this.deferredDetails = null;
       const mutationsBefore = this.sourceMutationCount;
       const statusSources = [];
       const counts = { sourceRecords: 0, unchanged: 0, ensured: 0, revoked: 0, reviews: 0, unknownChildRecords: 0, sourceWrites: 0, stopped: false };
@@ -514,10 +594,11 @@ export class SalesMirror {
         } catch (error) { this.review(safeCode(error)); counts.reviews++; }
       }
       let detailCounts = {};
-      if (!counts.stopped && this.detailEnabled) {
+      if (!counts.stopped && this.detailEnabled && allowDetailsStaging) {
         try {
-          if (deferDetails) this.deferredDetails = { views, childSnapshots, sourceResolved, work: null };
-          else detailCounts = await this.attemptDetails(this.prepareDetails(views, childSnapshots, sourceResolved, shouldStop), { shouldStop });
+          this.stageDetails(this.prepareDetails(views, childSnapshots, sourceResolved, shouldStop));
+          detailCounts = { detailWrites: 0, detailReviews: 0, detailFieldsReady: 0, ...this.detailStatus() };
+          if (!deferDetails && this.deferredDetails) detailCounts = await this.attemptDetails(this.deferredDetails.work, { shouldStop });
         }
         catch { detailCounts = { detailReviews: 1 }; }
       }

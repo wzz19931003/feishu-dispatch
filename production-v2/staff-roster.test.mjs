@@ -171,6 +171,82 @@ test('system writes only changed system fields, do not rewrite timestamps on qui
   f.client.change('A', { order: 8 }); f.provisioner.hook = employee => { f.client.change('A', { enabled: false }); return { state: 'ready', target: employee.target }; };
   assert.equal((await f.roster.refresh({ apply: true })).errors[0].code, 'STAFF_SNAPSHOT_CHANGED'); assert.equal(f.client.writes.length, written); assert.equal(f.roster.status().healthy, false);
 });
+test('eight established quiet employees use only two schema reads and one list per refresh', async t => {
+  const f = fixture(t, { rows: [row('A'), row('B'), ...Array.from({ length: 6 }, (_, index) => row(`Operator${index}`, { role: '运营', order: null }))] });
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(f.provisioner.calls.length, 8); assert.equal(f.client.writes.length, 8);
+  f.client.calls.length = 0; f.client.writes.length = 0; f.provisioner.calls.length = 0;
+  for (let pass = 0; pass < 2; pass++) assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(f.client.calls.length, 6);
+  assert.equal(f.client.calls.filter(call => call.url.endsWith('/fields')).length, 4);
+  assert.equal(f.client.calls.filter(call => call.url.endsWith('/records')).length, 2);
+  assert.equal(f.client.calls.filter(call => /\/records\//.test(call.url)).length, 0);
+  assert.equal(f.client.writes.length, 0); assert.equal(f.provisioner.calls.length, 0);
+  assert.equal(f.roster.status().counts.ready, 8); assert.equal(f.roster.configForMembers().members.filter(member => member.enabled).length, 2);
+});
+test('quiet disabled, paused and review rows also reuse only the validated list snapshot', async t => {
+  const f = fixture(t, { config: config({ extraFields: true }), now: () => Date.parse('2026-11-19T04:00:00Z'), rows: [
+    row('A', { enabled: false }), row('B', { leaveStart: '2026-11-19', leaveEnd: '2026-11-19' }),
+    row('C', { leaveStart: '2026-11-19', leaveEnd: '' })] });
+  assert.equal((await f.roster.refresh({ apply: true })).ok, false);
+  f.client.calls.length = 0; f.client.writes.length = 0;
+  assert.equal((await f.roster.refresh({ apply: true })).ok, false);
+  assert.equal(f.roster.status().healthy, true); assert.equal(f.client.calls.length, 3); assert.equal(f.client.writes.length, 0);
+  assert.equal(f.roster.status().counts.disabled, 1); assert.equal(f.roster.status().counts.paused, 1); assert.equal(f.roster.status().counts.review, 1);
+});
+test('a changed system cell still performs a fresh detailed read and refuses stale business or schema data', async t => {
+  for (const change of ['disabled', 'order', 'profile', 'schema']) {
+    const f = fixture(t, { config: config({ extraFields: true }) });
+    await f.roster.refresh({ apply: true }); f.client.change('A', { status: 'changed outside automation' });
+    f.client.calls.length = 0; f.client.writes.length = 0; let changed = false;
+    f.client.beforeRead = id => {
+      if (id !== 'recStaffA' || changed) return; changed = true;
+      if (change === 'disabled') f.client.change('A', { enabled: false });
+      if (change === 'order') f.client.change('A', { order: 8 });
+      if (change === 'profile') f.client.change('A', { salesWechat: 'offline-new-contact' });
+      if (change === 'schema') {
+        f.client.rename('status', 'renamed status');
+        f.client.schema.push({ field_id: 'fldOfflineUnrelatedStatus', field_name: NAMES.status, type: 1 });
+        f.client.rows.get(id).fields[NAMES.status] = 'unrelated field must stay';
+      }
+    };
+    const result = await f.roster.refresh({ apply: true });
+    assert.equal(result.errors[0].code, change === 'schema' ? 'STAFF_SCHEMA_CHANGED_DURING_READ' : 'STAFF_SNAPSHOT_CHANGED');
+    assert.equal(changed, true); assert.equal(f.client.calls.filter(call => call.url.endsWith('/records/recStaffA')).length, 1);
+    assert.equal(f.client.writes.length, 0); assert.equal(f.roster.status().healthy, false);
+    if (change === 'schema') assert.equal(f.client.rows.get('recStaffA').fields[NAMES.status], 'unrelated field must stay');
+  }
+});
+test('a system change corrected after listing is read freshly without an unnecessary PUT', async t => {
+  const f = fixture(t); await f.roster.refresh({ apply: true }); f.client.change('A', { status: 'external edit' });
+  f.client.calls.length = 0; f.client.writes.length = 0;
+  f.client.beforeRead = id => { if (id === 'recStaffA') f.client.change('A', { status: '可用' }); };
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(f.client.calls.length, 6); assert.equal(f.client.writes.length, 0);
+});
+test('a disable after a quiet snapshot cannot pass the unchanged final candidate guard', async t => {
+  const f = fixture(t); await f.roster.refresh({ apply: true });
+  f.client.calls.length = 0; f.client.writes.length = 0; let schemaReads = 0;
+  f.client.beforeSchema = () => { if (++schemaReads === 2) f.client.change('A', { enabled: false }); };
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true); assert.equal(f.client.calls.length, 3); assert.equal(f.client.writes.length, 0);
+  const member = byId(f.roster, 'sales_A');
+  assert.equal(await f.roster.verifyCandidate(member), false);
+  assert.equal(f.client.calls.length, 6); assert.equal(f.client.calls.filter(call => call.url.endsWith('/records/recStaffA')).length, 1);
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(byId(f.roster, 'sales_A').enabled, false); assert.equal(f.client.rows.get('recStaffA').fields.开通状态, '已停新单');
+});
+test('new and changed-version employees retain preparation and both detailed post-preparation rechecks even when outputs already match', async t => {
+  const f = fixture(t, { rows: [row('A'), row('B'), row('C', { status: '可用', personalUrl: target('C').baseUrl })] });
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(f.provisioner.calls.filter(employee => employee.recordId === 'recStaffC').length, 1);
+  assert.equal(f.client.calls.filter(call => call.method === 'GET' && call.url.endsWith('/records/recStaffC')).length, 2);
+  assert.equal(f.client.writes.some(write => write.id === 'recStaffC'), false);
+  f.client.change('A', { order: 8 }); f.client.calls.length = 0; f.client.writes.length = 0; f.provisioner.calls.length = 0;
+  assert.equal((await f.roster.refresh({ apply: true })).ok, true);
+  assert.equal(f.provisioner.calls.length, 1); assert.equal(f.provisioner.calls[0].recordId, 'recStaffA');
+  assert.equal(f.client.calls.filter(call => call.method === 'GET' && call.url.endsWith('/records/recStaffA')).length, 2);
+  assert.equal(f.client.writes.length, 0);
+});
 test('a provisioner cannot replace an established target, and a new duplicate target is rejected before publishing', async t => {
   const f = fixture(t); f.provisioner.hook = () => ({ state: 'ready', target: target('Other') });
   assert.equal((await f.roster.refresh({ apply: true })).errors[0].code, 'STAFF_MEMBER_BINDING_CHANGED'); assert.equal(byId(f.roster, 'sales_A').target.appToken, f.cfg.members[0].target.appToken);

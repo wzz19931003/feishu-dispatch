@@ -269,6 +269,15 @@ export class StaffRoster {
       const before = await resolveStaffSchema(this.client, this.staff), records = await pages(this.client, this.staff, 'records');
       if (hash(before) !== hash(await resolveStaffSchema(this.client, this.staff))) fail('STAFF_SCHEMA_CHANGED_DURING_SCAN');
       if (!records.length) fail('STAFF_EMPTY_ROSTER');
+      const recordsById = new Map(records.map(record => [record.record_id, record]));
+      const publishSystem = async (employee, desired, allowSnapshotNoop = true) => {
+        if (stop(shouldStop)) fail('STAFF_STOP_REQUESTED');
+        const record = recordsById.get(employee.recordId);
+        // The complete list was checked against the same field IDs before and after reading.
+        // A quiet row needs no write; every actual change still uses the fresh write guard.
+        if (allowSnapshotNoop && record && Object.entries(desired).every(([key, value]) => before[key] && text(cell(record, before[key])) === value)) return false;
+        return this.writeSystem(employee, desired, shouldStop);
+      };
       const snapshot = [], identities = new Set(), orders = new Set(); let drafts = 0;
       for (const record of records) {
         const employee = this.normalize(record, before), knownRow = this.registry().find(entry => entry.recordId === record.record_id);
@@ -286,7 +295,7 @@ export class StaffRoster {
       const counts = { rows: records.length, drafts, ready: 0, pending: 0, review: 0, disabled: 0, paused: 0, retired: this.registry().filter(entry => entry.retired).length };
       for (const employee of snapshot) {
         if (stop(shouldStop)) fail('STAFF_STOP_REQUESTED');
-        let entry = this.registry().find(item => item.openId === employee.openId), result, verified = false;
+        let entry = this.registry().find(item => item.openId === employee.openId), result, verified = false, prepared = false;
         const profile = { salesWechat: employee.salesWechat, salesWechatError: employee.salesWechatError, leaveStart: employee.leaveStart, leaveEnd: employee.leaveEnd, leaveError: employee.leaveError, profileVersion: employee.profileVersion };
         if (entry) entry = { ...entry, ...profile, recordId: employee.recordId, displayName: employee.displayName, enabled: employee.enabled, order: employee.order ?? entry.order, inputVersion: employee.version, retired: false };
         if (employee.salesWechatError) this.errors.push(employee.salesWechatError);
@@ -294,23 +303,24 @@ export class StaffRoster {
         if (employee.leaveError) {
           if (entry) this.put({ ...entry, state: 'review' });
           counts.review++; this.errors.push(employee.leaveError);
-          if (canWrite) await this.writeSystem(employee, { status: '需核查', error: employee.leaveError }, shouldStop);
+          if (canWrite) await publishSystem(employee, { status: '需核查', error: employee.leaveError });
           continue;
         }
         if (!employee.enabled) {
           if (entry) { entry.state = 'disabled'; this.put(entry); } counts.disabled++;
           if (employee.salesWechatError) counts.review++;
-          if (canWrite) await this.writeSystem(employee, { status: '已停新单', error: employee.salesWechatError }, shouldStop);
+          if (canWrite) await publishSystem(employee, { status: '已停新单', error: employee.salesWechatError });
           continue;
         }
         if (employee.onLeave) {
           if (entry) this.put({ ...entry, state: 'paused' });
           counts.paused++;
           if (employee.salesWechatError) counts.review++;
-          if (canWrite) await this.writeSystem(employee, { status: '休假中', error: employee.salesWechatError }, shouldStop);
+          if (canWrite) await publishSystem(employee, { status: '休假中', error: employee.salesWechatError });
           continue;
         }
         if (canWrite && (!entry?.ready || entry.checkedVersion !== employee.version)) {
+          prepared = true;
           if (!this.provisioner?.ensure) fail('STAFF_PROVISIONER_REQUIRED');
           try { result = await this.provisioner.ensure({ ...employee, ...(entry?.target ? { target: clone(entry.target) } : {}) }, { apply: true, shouldStop }); }
           catch (error) { if (stop(shouldStop)) fail('STAFF_STOP_REQUESTED'); result = { state: 'review', errorCode: safe(error) }; }
@@ -333,7 +343,7 @@ export class StaffRoster {
           counts[result.state]++; if (code) this.errors.push(code);
           if (entry) this.put({ ...entry, enabled: false, state: result.state });
         }
-        if (canWrite) await this.writeSystem(employee, { status: result.state === 'ready' ? employee.salesWechatError ? '需核查' : '可用' : result.state === 'review' ? '需核查' : '准备中', error: code, ...(result.state === 'ready' ? { personalUrl: employee.role === 'sales' ? entry.target.baseUrl : this.staff.operatorFormUrl } : {}) }, shouldStop);
+        if (canWrite) await publishSystem(employee, { status: result.state === 'ready' ? employee.salesWechatError ? '需核查' : '可用' : result.state === 'review' ? '需核查' : '准备中', error: code, ...(result.state === 'ready' ? { personalUrl: employee.role === 'sales' ? entry.target.baseUrl : this.staff.operatorFormUrl } : {}) }, !prepared);
       }
       counts.retired = this.registry().filter(entry => entry.retired).length;
       this.counts = counts; this.healthy = true; this.errors = [...new Set(this.errors)];
