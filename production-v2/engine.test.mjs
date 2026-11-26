@@ -52,6 +52,123 @@ async function fixture(t, { config = configuration(), client = new Client(), now
 }
 const numericRejection = () => Object.assign(new Error('offline definite rejection'), { code: '99991400' });
 
+function targetEvent(target, id, recordId, action = 'record_edited') {
+  return { id, appToken: target.appToken, tableId: target.tableId, recordIds: [recordId], actions: [{ action, recordId }] };
+}
+
+test('sales feedback is durable, deduplicated, and notifies only after a verified current negative writeback', async t => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'workflow-child-feedback-'));
+  const dbPath = path.join(folder, 'workflow.sqlite');
+  const client = new Client([lead('fastFeedback', { owner: 'ou_offlineSalesA' }), lead('negativeHistory', { owner: 'ou_offlineSalesA', wxStatus: '号码错误' })]);
+  const { engine } = await fixture(t, { dbPath, client });
+  let resumed;
+  t.after(async () => { await resumed?.close(); await engine.close(); rmSync(folder, { recursive: true, force: true }); });
+  const target = engine.config.members[0].target;
+  const childId = 'recPrivateFeedback';
+  const edited = targetEvent(target, 'offline-sales-edit', childId);
+  const wrongTarget = targetEvent({ ...target, tableId: 'tblWrongTarget' }, 'offline-wrong-table', childId);
+  engine.mirror.feedbackForRecord = async () => { throw new Error('worker must wait until after restart'); };
+  assert.equal(engine.acceptEvent(wrongTarget), false);
+  assert.equal(engine.acceptEvent(targetEvent(target, 'offline-created-child', childId, 'record_added')), false);
+  assert.equal(engine.acceptEvent(edited), true);
+  assert.equal(engine.acceptEvent(edited), false);
+  assert.equal(engine.status().eventsPending, 1);
+  assert.equal(engine.all('v2_inbox').length, 0);
+  assert.equal(engine.all('v2_sales_inbox').length, 1);
+  await engine.close();
+
+  resumed = new WorkflowEngine({ config: configuration(), client, dbPath });
+  assert.equal(resumed.status().eventsPending, 1);
+  assert.equal(resumed.all('v2_inbox').length, 0);
+  const mirror = resumed.mirror = new Mirror(resumed);
+  let edit = '未通过', calls = 0;
+  mirror.feedbackForRecord = async ({ appToken, tableId, targetRecordId }) => {
+    calls++;
+    assert.deepEqual([appToken, tableId, targetRecordId], [target.appToken, target.tableId, childId]);
+    if (edit === 'current-unchanged') return { statusSources: [] };
+    if (edit === 'stale-without-receipt') return { statusSources: [await resumed.readSource('recLeadnegativeHistory')] };
+    if (edit === 'deleted') return { statusSources: [], needsReconciliation: true };
+    mirror.editSalesStatus('recLeadfastFeedback', edit);
+    return { statusSources: [await resumed.readSource('recLeadfastFeedback')] };
+  };
+  const master = { appToken: resumed.config.appToken, tableId: resumed.config.tableIds.leads };
+  assert.equal(resumed.acceptEvent(targetEvent(master, 'offline-quiescent-master-event', 'recLeadnegativeHistory')), true);
+  assert.equal(resumed.status().eventsPending, 2);
+  const list = client.listRecords.bind(client);
+  client.listRecords = async () => { throw new Error('fast feedback must precede full scans'); };
+  assert.equal(resumed.acceptEvent(edited), false);
+  assert.equal((await resumed.processPendingEvents()).processed, 2);
+  assert.equal(client.sent.length, 1);
+  assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA');
+  assert.match(client.sent[0].text, /未通过/);
+  assert.equal(resumed.status().eventsPending, 0);
+
+  for (const status of ['通过', 'current-unchanged', 'stale-without-receipt']) {
+    edit = status;
+    assert.equal(resumed.acceptEvent(targetEvent(target, `event-${status}`, childId)), true);
+    assert.equal((await resumed.processPendingEvents()).processed, 1);
+    assert.equal(client.sent.length, 1);
+  }
+  assert.equal(calls, 4);
+  assert.equal(client.records.get('recLeadfastFeedback').fields.微信状态, '通过');
+
+  edit = 'deleted';
+  assert.equal(resumed.acceptEvent(targetEvent(target, 'offline-child-deleted', childId, 'record_deleted')), true);
+  await resumed.processPendingEvents();
+  assert.equal(resumed.status().eventsPending, 1);
+  client.listRecords = list;
+  mirror.sync = async () => ({ reviews: 1 });
+  await resumed.scan({ apply: true });
+  assert.equal(resumed.status().eventsPending, 1);
+  mirror.sync = async () => ({ reviews: 0 });
+  await resumed.scan({ apply: true });
+  assert.equal(resumed.status().eventsPending, 0);
+  assert.equal(client.sent.length, 1);
+});
+
+test('master event starts the operator copy without waiting for the sales copy, with contact delivered first', async t => {
+  const { engine, client, mirror } = await fixture(t);
+  const record = lead('parallelIntake', { addMethod: '客户主动加' });
+  client.add(record);
+  const gate = Promise.withResolvers();
+  const operator = { openId: 'ou_offlineOperatorA' };
+  engine.staff = { async refresh() { return { ok: true }; }, async verifyCandidate() { return true; }, operatorCandidates: () => [operator] };
+  engine.operatorMirror = {
+    async syncRecord(view, { operators }) {
+      assert.deepEqual(operators, [operator]);
+      assert.equal(view.id, record.record_id);
+      assert.equal(view.owner, 'ou_offlineSalesA');
+      client.operations.push('operator-copy-started');
+      await gate.promise;
+      return { synced: true };
+    },
+  };
+  const ensure = mirror.ensure.bind(mirror);
+  mirror.ensure = async view => {
+    assert.ok(client.operations.includes('operator-copy-started'));
+    assert.equal(client.sent[0]?.recipientOpenId, operator.openId);
+    return ensure(view);
+  };
+  const send = client.sendNotification.bind(client);
+  client.sendNotification = async input => {
+    const result = await send(input);
+    if (input.recipientOpenId === 'ou_offlineSalesA') gate.resolve();
+    return result;
+  };
+  const master = { appToken: engine.config.appToken, tableId: engine.config.tableIds.leads };
+  assert.equal(engine.acceptEvent(targetEvent(master, 'offline-main-intake', record.record_id, 'record_added')), true);
+  const processing = engine.processPendingEvents();
+  let timer;
+  try {
+    const result = await Promise.race([processing, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('single-record operator and sales lanes must not wait for each other')), 1000);
+    })]);
+    assert.equal(result.processed, 1);
+    assert.deepEqual(result.errors, []);
+    assert.deepEqual(client.sent.map(item => item.recipientOpenId), [operator.openId, 'ou_offlineSalesA']);
+  } finally { clearTimeout(timer); gate.resolve(); await processing; }
+});
+
 test('seven master-event records notify before any full-table or mirror scan and retain restart deduplication', async t => {
   const folder = mkdtempSync(path.join(tmpdir(), 'workflow-event-notices-'));
   const dbPath = path.join(folder, 'workflow.sqlite');
@@ -298,7 +415,8 @@ test('real engine and sales mirror fill three historical private tables includin
   t.after(() => engine.close());
   engine.mirror = new SalesMirror({ config: engine.config, db: engine.db, sourceClient: source,
     clientFactory: token => children.get(token), readSource: id => engine.readSource(id), resolveSource: () => engine.resolveSource(),
-    operatorNames: () => new Map([['ou_offlineOperatorA', 'Offline operator']]), auditDetailsTarget: async () => true });
+    operatorNames: () => new Map([['ou_offlineOperatorA', 'Offline operator']]),
+    auditDetailsTarget: async (_member, _stopped, _deadline, { phase } = {}) => phase !== 'create' });
   await engine.initialize();
   engine.staff = { async refresh() { return { ok: true }; }, status() { return { healthy: true }; }, operatorCandidates() { return []; } };
   engine.operatorMirror = { async sync() { throw Object.assign(new Error('offline unrelated link failure'), { code: 'OPERATOR_LINK_FAILURE' }); } };
@@ -713,12 +831,17 @@ test('real engine and real SalesMirror integrate quiet legacy copy, child feedba
     assert.equal(source.sent.length, 1); assert.equal(source.sent[0].recipientOpenId, 'ou_offlineSalesA'); assert.equal(source.sent[0].url, '');
     const beforeTransfer = engine.mirror.rows().find(row => row.sourceId === 'recLeadnew' && row.state === 'active');
     const oldChild = children.get(config.members[0].target.appToken); oldChild.records.get(beforeTransfer.targetRecordId).fields.微信状态 = '未通过';
-    const feedback = await engine.scan({ apply: true });
-    assert.equal(source.records.get('recLeadnew').fields.微信状态, '未通过'); assert.equal(feedback.needsRescan, true); assert.ok(feedback.nextRetryAt <= Date.now() + 1100);
-    assert.equal(source.sent.length, 2); // Confirmed feedback delivers before the scan ends.
+    const event = targetEvent(config.members[0].target, 'offline-real-child-edited', beforeTransfer.targetRecordId);
+    assert.equal(engine.acceptEvent(event), true);
+    const feedback = await engine.processPendingEvents();
+    assert.equal(feedback.processed, 1); assert.deepEqual(feedback.errors, []);
+    assert.equal(source.records.get('recLeadnew').fields.微信状态, '未通过');
+    assert.equal(engine.meta('mirror_rescan_needed'), true); assert.ok(engine.nextRetryAt() <= Date.now() + 1100);
+    assert.equal(source.sent.length, 2); // Confirmed feedback delivers before the fallback scan starts.
     assert.equal(source.sent[1].recipientOpenId, 'ou_offlineOperatorA');
     await engine.close(); engine = attach(new WorkflowEngine({ config, client: source, dbPath }));
     assert.equal(engine.meta('mirror_rescan_needed'), true); // The fallback scan remains scheduled across restarts.
+    assert.equal(engine.acceptEvent(event), false);
     await engine.scan({ apply: true }); assert.equal(source.sent.length, 2); assert.equal(source.sent[1].recipientOpenId, 'ou_offlineOperatorA'); assert.ok(source.sent[1].text.includes('未通过'));
     for (const wxStatus of ['号码错误', '待添加', '未通过']) {
       source.change('recLeadnew', { wxStatus });

@@ -13,6 +13,7 @@ const COPY_FIELDS = Object.freeze(['wx', 'needs', 'wxStatus', 'addMethod', 'part
 const FEEDBACK_FIELDS = new Set(['wxStatus', 'wx', 'needs', 'partySize']);
 const STATUS_WRITEBACK_UNCONFIRMED = 'MIRROR_STATUS_WRITEBACK_OUTCOME_UNKNOWN';
 export const SALES_DETAIL_BUDGET_MS = 12_000;
+const CREATE_DETAIL_BUDGET_MS = 6000;
 const SALES_DETAIL_LIMIT_CODES = new Set(['99991400', 'HTTP_429', 'RATE_LIMIT', 'SALES_DETAILS_RATE_LIMIT']);
 const equal = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
 const targetIdentity = target => JSON.stringify([target.appToken, target.tableId]);
@@ -196,6 +197,17 @@ export class SalesMirror {
       if (typeof name === 'string' && name.length <= 200) values.operatorName = name;
     }
     return values;
+  }
+  async initialDetailEligibility(member, shouldStop) {
+    if (typeof this.auditDetailsTarget !== 'function') return false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(this.detailBudgetMs, CREATE_DETAIL_BUDGET_MS));
+    const expired = new Promise(resolve => controller.signal.addEventListener('abort', () => resolve(false), { once: true }));
+    const audit = Promise.resolve().then(() => this.auditDetailsTarget(member,
+      () => controller.signal.aborted || stopped(shouldStop), controller.signal, { phase: 'create' }))
+      .then(allowed => allowed === true && !controller.signal.aborted && !stopped(shouldStop)).catch(() => false);
+    try { return await Promise.race([audit, expired]); }
+    finally { clearTimeout(timer); controller.abort(); }
   }
   prepareDetails(views, childSnapshots, sourceResolved, shouldStop) {
     const work = { sourceResolved, names: null, candidates: [], reviews: 0 };
@@ -387,18 +399,40 @@ export class SalesMirror {
   }
   async create(source, member, shouldStop) {
     const target = member.target, client = this.clientFactory(target.appToken);
-    const resolved = await resolveFields(client, target);
+    const names = this.operatorNames?.();
+    const wantedDetails = Boolean(this.detailEnabled && Number.isSafeInteger(source.leadDate) && source.operator &&
+      names instanceof Map && typeof names.get(source.operator) === 'string' && names.get(source.operator).trim());
+    // Only read-only ACL work is speculative. The authoritative source read follows its deadline.
+    const eligible = wantedDetails ? this.initialDetailEligibility(member, shouldStop) : Promise.resolve(false);
+    let schema;
+    const resolved = await resolveFields(client, target, { observeSchema: fields => { schema = fields; } });
     for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
+    const detailFields = this.detailEnabled ? this.detailFields(member, schema) : null;
+    const includeDetails = await eligible;
     const latest = await this.source(source.id);
     if (!latest || latest.owner !== member.openId) fail('MIRROR_OWNERSHIP_CHANGED');
     const previousVersions = this.rows().filter(row => row.sourceId === source.id).map(row => row.version);
     const version = previousVersions.length ? Math.max(...previousVersions) + 1 : 1;
-    const atCreate = await resolveFields(client, target);
+    let finalSchema;
+    const atCreate = await resolveFields(client, target, { observeSchema: fields => { finalSchema = fields; } });
     if (fingerprint(atCreate) !== fingerprint(resolved)) fail('MIRROR_TARGET_SCHEMA_CHANGED_BEFORE_WRITE');
-    const values = this.values(latest, atCreate, member), fields = encodePatch(values, atCreate);
+    let extras = {}, extraFields = {};
+    const finalNames = this.operatorNames?.();
+    if (includeDetails && detailFields && finalNames instanceof Map && Number.isSafeInteger(latest.leadDate) && latest.operator &&
+        typeof finalNames.get(latest.operator) === 'string' && finalNames.get(latest.operator).trim() &&
+        fingerprint(detailFields) === fingerprint(this.detailFields(member, finalSchema))) {
+      extraFields = detailFields;
+      extras = this.detailValues(latest, extraFields, finalNames);
+    }
+    const values = this.values(latest, atCreate, member), fields = encodePatch({ ...values, ...extras }, { ...atCreate, ...extraFields });
     let row = { id: fingerprint([this.config.appToken, this.config.tableIds.leads, source.id, version]), sourceAppToken: this.config.appToken, sourceTableId: this.config.tableIds.leads, sourceId: source.id, version, owner: member.openId, memberId: member.id,
       target: structuredClone(target), targetRecordId: null, state: 'creating', clientToken: randomUUID(), baseValues: values, createdAt: iso(), errorCode: '' };
+    if (wantedDetails) row.detailJob = { pending: true, pendingSince: this.now(), attempts: 0, nextAttemptAt: 0,
+      lastErrorCode: Object.keys(extras).length ? '' : 'SALES_DETAIL_CREATE_DEFERRED', writeUnconfirmed: false };
+    await this.assertLiveConfig();
     this.checkWrite(shouldStop);
+    if (Object.keys(extras).length) this.db.prepare('INSERT OR IGNORE INTO v2_sales_detail_pins(target,date_id,operator_name_id) VALUES(?,?,?)')
+      .run(targetIdentity(target), extraFields.leadDate.fieldId, extraFields.operatorName.fieldId);
     this.put(row);
     let record;
     try {
@@ -417,11 +451,19 @@ export class SalesMirror {
     if (!after || after.owner !== row.owner) { await this.revoke(row, { shouldStop }); fail('MIRROR_OWNERSHIP_CHANGED'); }
     const confirmed = await this.targetRecord(row);
     if (!confirmed) { this.put({ ...row, state: 'target_missing_review', errorCode: 'MIRROR_CREATE_UNCONFIRMED' }); this.review('MIRROR_CREATE_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_TARGET_MISSING_REVIEW_REQUIRED'); }
-    const targetView = recordView(confirmed, resolved);
-    if (Object.entries(values).some(([key, value]) => !equal(targetView[key], value))) { this.review('MIRROR_CREATE_CONTENT_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_CREATE_CONTENT_UNCONFIRMED'); }
+    const targetView = recordView(confirmed, { ...resolved, ...extraFields });
+    const echoed = recordView(record, resolved), status = targetView.wxStatus;
+    const rapidStatusEdit = Object.hasOwn(confirmed.fields || {}, resolved.wxStatus.name) &&
+      Object.hasOwn(record.fields || {}, resolved.wxStatus.name) && equal(echoed.wxStatus, values.wxStatus) &&
+      typeof status === 'string' && status.trim().length > 0 && status.length <= 200 &&
+      (resolved.wxStatus.type !== 3 || resolved.wxStatus.property?.options?.some(option => option.name === status));
+    if (Object.entries(values).some(([key, value]) => !equal(targetView[key], value) && !(key === 'wxStatus' && rapidStatusEdit))) { this.review('MIRROR_CREATE_CONTENT_UNCONFIRMED', row.sourceId, row.id); fail('MIRROR_CREATE_CONTENT_UNCONFIRMED'); }
+    if (Object.keys(extras).length && Object.entries(extras).every(([key, value]) => equal(targetView[key], value))) {
+      row = this.saveDetailJob(row.id, { pending: false, nextAttemptAt: 0, lastErrorCode: '', lastSuccessAt: this.now() });
+    }
     return row;
   }
-  async reconcile(row, member, shouldStop, statusSources) {
+  async reconcile(row, member, shouldStop, statusSources, { verifyChild = false } = {}) {
     const client = this.clientFactory(row.target.appToken), resolved = await resolveFields(client, member.target);
     for (const key of ['wx', 'needs', ...this.feedback]) if (!resolved[key]) fail('MIRROR_TARGET_FIELDS_INCOMPLETE');
     const sourceResolved = await this.resolveSource();
@@ -449,12 +491,38 @@ export class SalesMirror {
       if (row.feedbackBlocked) fail('MIRROR_FEEDBACK_REVIEW_REQUIRED');
       if ((row.feedbackNextAttemptAt || 0) > this.now()) fail('MIRROR_FEEDBACK_RETRY_LATER');
       // The source update uses only immutable backend mapping, never a child source-ID column.
-      const final = await this.source(row.sourceId);
+      let final;
+      if (verifyChild) {
+        const [beforeSource, beforeTarget] = await Promise.all([this.resolveSource(), resolveFields(client, member.target)]);
+        if (fingerprint(beforeSource) !== fingerprint(sourceResolved) || fingerprint(beforeTarget) !== fingerprint(resolved)) fail('MIRROR_FEEDBACK_SCHEMA_CHANGED');
+        const [sourceRecord, childRecord] = await Promise.all([
+          this.sourceClient.readRecord(this.config.tableIds.leads, row.sourceId), this.targetRecord(row),
+        ]);
+        const [afterSource, afterTarget] = await Promise.all([this.resolveSource(), resolveFields(client, member.target)]);
+        if (fingerprint(afterSource) !== fingerprint(sourceResolved) || fingerprint(afterTarget) !== fingerprint(resolved)) fail('MIRROR_FEEDBACK_SCHEMA_CHANGED');
+        if (!childRecord) fail('MIRROR_TARGET_MISSING_REVIEW_REQUIRED');
+        const currentChild = recordView(childRecord, afterTarget);
+        if (Object.keys(inbound).some(key => !equal(currentChild[key], targetView[key]))) fail('MIRROR_FEEDBACK_SUPERSEDED');
+        final = recordView(sourceRecord, afterSource);
+      } else final = await this.source(row.sourceId);
       if (!final || final.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
       for (const key of Object.keys(inbound)) if (!equal(final[key], fresh[key])) { this.review('MIRROR_FEEDBACK_CONFLICT', row.sourceId, row.id); fail('MIRROR_FEEDBACK_CONFLICT'); }
       const atSourceWrite = await this.resolveSource();
       if (fingerprint(atSourceWrite) !== fingerprint(sourceResolved)) fail('MIRROR_SOURCE_SCHEMA_CHANGED_BEFORE_WRITE');
       const patch = encodePatch(inbound, atSourceWrite);
+      await this.assertLiveConfig();
+      if (verifyChild) {
+        // Last value reads follow all awaited ACL/schema/config work. A quick B -> A must not write stale B.
+        const [sourceRecord, childRecord] = await Promise.all([
+          this.sourceClient.readRecord(this.config.tableIds.leads, row.sourceId), this.targetRecord(row),
+        ]);
+        if (!childRecord) fail('MIRROR_TARGET_MISSING_REVIEW_REQUIRED');
+        const currentChild = recordView(childRecord, resolved), currentSource = recordView(sourceRecord, atSourceWrite);
+        if (Object.keys(inbound).some(key => !equal(currentChild[key], inbound[key]))) fail('MIRROR_FEEDBACK_SUPERSEDED');
+        if (currentSource.owner !== row.owner) fail('MIRROR_OWNERSHIP_CHANGED');
+        if (Object.keys(inbound).some(key => !equal(currentSource[key], final[key]))) fail('MIRROR_FEEDBACK_CONFLICT');
+        final = currentSource;
+      }
       this.checkWrite(shouldStop);
       const attempts = (row.feedbackAttempts || 0) + 1;
       statusWritebackIntent = Object.hasOwn(inbound, 'wxStatus') ? { id: randomUUID(), owner: row.owner, from: final.wxStatus, to: inbound.wxStatus } : null;
@@ -476,6 +544,7 @@ export class SalesMirror {
       const atTargetWrite = await resolveFields(client, member.target);
       if (fingerprint(atTargetWrite) !== fingerprint(resolved)) fail('MIRROR_TARGET_SCHEMA_CHANGED_BEFORE_WRITE');
       const patch = encodePatch(outbound, atTargetWrite);
+      await this.assertLiveConfig();
       this.checkWrite(shouldStop);
       await client.updateRecord(row.target.tableId, row.targetRecordId, patch);
     }
@@ -517,6 +586,33 @@ export class SalesMirror {
     fail('MIRROR_OWNERSHIP_UNSTABLE');
   }
   ensure(view, options = {}) { return this.exclusive(() => this.ensureInternal(view, options)); }
+  feedbackForRecord({ appToken, tableId, targetRecordId, shouldStop = () => false } = {}) {
+    return this.exclusive(async () => {
+      this.checkWrite(shouldStop);
+      const matches = this.rows().filter(row => row.target?.appToken === appToken && row.target?.tableId === tableId && row.targetRecordId === targetRecordId);
+      if (matches.length !== 1 || matches[0].state !== 'active') return { statusSources: [], needsReconciliation: true };
+      const row = matches[0];
+      if (row.sourceAppToken !== this.config.appToken || row.sourceTableId !== this.config.tableIds.leads || this.latest(row.sourceId)?.id !== row.id) return { statusSources: [], needsReconciliation: true };
+      await this.assertLiveConfig();
+      let member;
+      try { member = this.member(row.owner); } catch { return { statusSources: [], needsReconciliation: true }; }
+      if (member.id !== row.memberId || fingerprint(member.target) !== fingerprint(row.target)) return { statusSources: [], needsReconciliation: true };
+      if (typeof this.auditDetailsTarget === 'function') {
+        const controller = new AbortController(), timer = setTimeout(() => controller.abort(), this.detailBudgetMs);
+        try {
+          const allowed = await this.auditDetailsTarget(member, () => controller.signal.aborted || stopped(shouldStop), controller.signal, { phase: 'feedback' });
+          if (!allowed || controller.signal.aborted) fail('MIRROR_TARGET_ACCESS_UNVERIFIED');
+        } finally { clearTimeout(timer); controller.abort(); }
+      }
+      const statusSources = [];
+      try { await this.reconcile(row, member, shouldStop, statusSources, { verifyChild: true }); }
+      catch (error) {
+        if (['MIRROR_OWNERSHIP_CHANGED', 'MIRROR_FEEDBACK_SUPERSEDED', 'MIRROR_TARGET_MISSING_REVIEW_REQUIRED'].includes(safeCode(error))) return { statusSources: [], needsReconciliation: true };
+        throw error;
+      }
+      return { statusSources };
+    });
+  }
   sync({ shouldStop = () => false, sourceViews, deferDetails = false, allowDetailsStaging = true } = {}) {
     return this.exclusive(async () => {
       const mutationsBefore = this.sourceMutationCount;

@@ -19,7 +19,7 @@ const fieldTypes = { wx: [1], needs: [1], wxStatus: [3], addMethod: [1, 3], part
 const text = value => value == null ? '' : Array.isArray(value) ? value.map(text).join('') : object(value)
   ? String(value.text ?? value.name ?? '') : String(value);
 
-/** Outbound-only operator copies. The caller supplies a complete source snapshot and verified operator roster. */
+/** Outbound-only operator copies. Full sync requires a complete snapshot; syncRecord never infers absence. */
 export class OperatorMirror {
   constructor({ config, db, client, readSource, resolveSource, assertLiveConfig = async () => {},
     verifyOperator = async () => true, now = Date.now, maxWrites = 40 } = {}) {
@@ -361,6 +361,57 @@ export class OperatorMirror {
     const latest = await this.source(view.id);
     if (!latest || latest.operator !== resource.id) {
       if (await this.revoke(row, shouldStop)) this.scan.revoked++;
+    }
+  }
+  async syncRecord(view, { operators, shouldStop = () => false } = {}) {
+    if (this.busy) fail('OPERATOR_MIRROR_BUSY');
+    if (!object(view) || !rowId(view.id) || view.operator && !personId(view.operator) || typeof shouldStop !== 'function') fail('OPERATOR_SOURCE_SNAPSHOT_INVALID');
+    this.featureEnabled();
+    const active = this.validateOperators(operators);
+    const operator = active.get(view.operator), resource = operator && this.resource(operator.openId);
+    // Provisioning and whole-table cleanup belong to the authoritative full scan.
+    if (!operator || resource?.stage !== 'ready') return { synced: false, needsReconciliation: true };
+    const previous = { active: this.active, scan: this.scan, writes: this.writes };
+    this.active = active;
+    this.scan = { sourceRecords: 1, created: 0, updated: 0, revoked: 0, unchanged: 0, pending: 0, revocationBacklog: 0, reviews: 0 };
+    this.writes = 0;
+    this.busy = true;
+    try {
+      await this.guard(operator, shouldStop);
+      const fields = await this.auditResource(resource);
+      const records = await this.snapshot(resource);
+      if (hash(await this.schema(this.target(resource))) !== hash(fields)) fail('OPERATOR_SCHEMA_CHANGED_DURING_READ');
+      const trusted = new Set(this.all('copies').filter(row => row.operatorId === resource.id).map(row => row.targetRecordId));
+      for (const id of records.keys()) if (!trusted.has(id)) fail('OPERATOR_UNTRUSTED_CHILD_RECORD');
+      const fresh = await this.source(view.id);
+      if (!fresh || fresh.operator !== operator.openId) return { synced: false, needsReconciliation: true };
+      // Only this source's tombstones may be touched. Omitted sources are never deletions.
+      for (const row of this.all('copies').filter(row => row.sourceId === view.id && row.state === 'revoked' && row.targetRecordId)) {
+        if (this.writes >= this.maxWrites) return { synced: false, needsReconciliation: true };
+        if (await this.revoke(row, shouldStop)) {
+          this.scan.revoked++;
+          if (row.operatorId === resource.id) records.delete(row.targetRecordId);
+        }
+      }
+      await this.ensure(fresh, resource, operator, fields, records, shouldStop);
+      if (this.scan.pending || this.scan.revocationBacklog || stop(shouldStop)) return { synced: false, needsReconciliation: true };
+      const copies = this.liveCopies(view.id), row = copies.length === 1 ? copies[0] : null;
+      if (row?.state !== 'active' || row.operatorId !== resource.id || !rowId(row.targetRecordId)) return { synced: false, needsReconciliation: true };
+      const record = await this.child(resource, row.targetRecordId);
+      if (hash(await this.schema(this.target(resource))) !== hash(fields)) fail('OPERATOR_SCHEMA_CHANGED_DURING_READ');
+      const current = await this.source(view.id);
+      await this.guard(operator, shouldStop);
+      if (!record || !current || current.operator !== resource.id || hash(this.childValues(record, fields)) !== hash(this.values(current, fields))) return { synced: false, needsReconciliation: true };
+      return { synced: true };
+    } catch (error) {
+      const code = safe(error);
+      this.review(code, view.id, this.liveCopies(view.id)[0]?.id ?? resource.id);
+      throw Object.assign(new Error(code), { code });
+    } finally {
+      this.active = previous.active;
+      this.scan = previous.scan;
+      this.writes = previous.writes;
+      this.busy = false;
     }
   }
   async sync(views, { operators, shouldStop = () => false } = {}) {

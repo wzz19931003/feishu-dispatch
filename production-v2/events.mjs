@@ -6,15 +6,18 @@ const failure = code => Object.assign(new Error(code), { code });
 
 /** Exactly one connection receives only the explicitly configured master/child tables. */
 export class WorkflowEvents {
-  constructor(config, { sdkLoader = () => import('@larksuiteoapi/node-sdk'), timeoutMs = 30000 } = {}) {
+  constructor(config, { sdkLoader = () => import('@larksuiteoapi/node-sdk'), timeoutMs = 30000, currentConfig = () => config } = {}) {
     this.config = config; this.sdkLoader = sdkLoader; this.timeoutMs = timeoutMs;
+    this.currentConfig = currentConfig;
     this.session = null; this.stopping = null; this.last = 'idle';
   }
   allows(event) {
-    const allowed = new Set([`${this.config.appToken}/${this.config.tableIds.leads}`,
-      ...this.config.members.filter(m => m.target).map(m => `${m.target.appToken}/${m.target.tableId}`),
-      ...(this.config.staffManagement?.enabled?[`${this.config.staffManagement.appToken}/${this.config.staffManagement.tableId}`]:[])]);
-    return allowed.has(`${event.appToken}/${event.tableId}`);
+    const config = this.currentConfig();
+    const matches = (appToken, tableId) => event.appToken === appToken && event.tableId === tableId;
+    const staff = config.staffManagement;
+    return matches(config.appToken, config.tableIds.leads) ||
+      config.members.some(member => member.target && matches(member.target.appToken, member.target.tableId)) ||
+      Boolean(staff?.enabled && matches(staff.appToken, staff.tableId));
   }
   status() { return { state: this.session?.state || this.last }; }
   async start(onEvent) {

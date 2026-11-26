@@ -74,7 +74,7 @@ test('the runner preempts only deferred work when a core event arrives', { timeo
       if (++scans === 2) requestStop(root);
       return { ok: true, salesDetailsReady: true };
     },
-    async acceptEvent() { calls.push('core event'); },
+    async acceptEvent() { calls.push('core event'); return true; },
     async syncDeferredSalesDetails({ signal }) {
       calls.push('idle slice');
       await eventHandler({ id: 'fixture-event' });
@@ -303,7 +303,8 @@ test('a personal event aborts attachment work and resumes core without the extra
   const calls = [];
   class FakeEvents { status() { return { state: eventHandler ? 'connected' : 'idle' }; } async start(handler) { eventHandler = handler; } async stop() {} }
   const engine = {
-    status: () => ({ initialized: true }), async acceptEvent() { return false; },
+    status: () => ({ initialized: true }), async acceptEvent() { return true; },
+    isSalesEvent: event => event.appToken === 'PERSONAL' && event.tableId === 'PERSONAL-TABLE',
     async scan() { scans++; calls.push('core'); if (scans === 2) requestStop(root); return { ok: true }; },
     attachmentDueAt() { return 0; },
     async syncDeferredAttachments({ signal }) {
@@ -327,14 +328,15 @@ function fakeSdk(){
 test('one event stream accepts only exact configured master and personal table identities',async()=>{
   const {captured,sdk}=fakeSdk(),received=[];
   const config={appId:'fake-app',appSecret:'fake-secret',appToken:'MASTER',tableIds:{leads:'LEADS'},members:[{target:{appToken:'CHILD',tableId:'PERSONAL'}}]};
-  const events=new WorkflowEvents(config,{sdkLoader:async()=>sdk,timeoutMs:500});
+  let currentConfig=config;
+  const events=new WorkflowEvents(config,{sdkLoader:async()=>sdk,timeoutMs:500,currentConfig:()=>currentConfig});
   await events.start(e=>received.push(`${e.appToken}/${e.tableId}`));
   const deliver=async(base,table)=>captured.handlers['drive.file.bitable_record_changed_v1']({header:{event_id:'test'},event:{file_token:base,table_id:table,action_list:[{record_id:'rec_test',action:'record_edited'}]}});
   await deliver('MASTER','LEADS');await deliver('CHILD','PERSONAL');await deliver('CHILD','OTHER');await deliver('FOREIGN','LEADS');
   assert.deepEqual(received,['MASTER/LEADS','CHILD/PERSONAL']);
-  config.members.push({target:{appToken:'NEWCHILD',tableId:'NEWPERSONAL'}});
+  currentConfig={...config,members:[...config.members,{target:{appToken:'NEWCHILD',tableId:'NEWPERSONAL'}}]};
   await deliver('NEWCHILD','NEWPERSONAL');assert.equal(received.length,3);
-  config.members.splice(0,1);await deliver('CHILD','PERSONAL');assert.equal(received.length,3);
+  currentConfig={...config,members:currentConfig.members.slice(1)};await deliver('CHILD','PERSONAL');assert.equal(received.length,3);
   const oldHandler=captured.handlers['drive.file.bitable_record_changed_v1'];await events.stop();
   await oldHandler({event:{file_token:'MASTER',table_id:'LEADS'}});
   assert.equal(received.length,3);assert.equal(captured.closes,1);assert.equal(events.status().state,'stopped');

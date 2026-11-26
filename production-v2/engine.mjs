@@ -23,10 +23,14 @@ const enabledPool = config => [...config.members].filter(member => member.enable
 const stableConfig = config => { const { members, pendingTargets, ...rest } = config; return digest(rest); };
 const memberPin = member => ({ id: member.id, openId: member.openId, target: member.target });
 const MIRROR_MANUAL = new Set(['MIRROR_CREATE_REVIEW_REQUIRED', 'MIRROR_REVOKE_REVIEW_REQUIRED']);
+const salesEventKey = (event, id) => digest([event.appToken, event.tableId, id]);
+const salesEvent = event => event.scope === 'sales';
+const eventTable = event => salesEvent(event) ? 'v2_sales_inbox' : 'v2_inbox';
 
-async function listAll(client, tableId) {
+async function listAll(client, tableId, shouldStop) {
   const rows = [], ids = new Set(), tokens = new Set(); let token;
   do {
+    if (stopped(shouldStop)) return null;
     const page = await client.listRecords(tableId, { pageSize: 100, ...(token ? { pageToken: token } : {}) });
     if (!Array.isArray(page?.items)) fail('SOURCE_RESPONSE_INVALID');
     for (const record of page.items) {
@@ -56,7 +60,8 @@ export class WorkflowEngine {
       CREATE TABLE IF NOT EXISTS v2_snapshots(id TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS v2_outbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS v2_reviews(id TEXT PRIMARY KEY,data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS v2_inbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS v2_inbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS v2_sales_inbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);`);
     if(this.config.staffManagement?.enabled)this.db.exec('CREATE TABLE IF NOT EXISTS v2_staff_runtime_events(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
     try { this.bindSource(); } catch (error) { this.db.close(); throw error; }
     for (const task of this.all('v2_outbox').filter(task => task.state === 'sending')) {
@@ -82,7 +87,7 @@ export class WorkflowEngine {
   stamp() { return new Date(this.now()).toISOString(); }
   meta(key) { const row = this.db.prepare('SELECT value FROM v2_meta WHERE key=?').get(key); return row ? JSON.parse(row.value) : null; }
   setMeta(key, value) { this.db.prepare('INSERT INTO v2_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)); }
-  table(table) { if (!['v2_snapshots', 'v2_outbox', 'v2_reviews', 'v2_inbox'].includes(table)) fail('INTERNAL_TABLE_INVALID'); return table; }
+  table(table) { if (!['v2_snapshots', 'v2_outbox', 'v2_reviews', 'v2_inbox', 'v2_sales_inbox'].includes(table)) fail('INTERNAL_TABLE_INVALID'); return table; }
   all(table) { return this.db.prepare(`SELECT data FROM ${this.table(table)} ORDER BY id`).all().map(row => JSON.parse(row.data)); }
   get(table, id) { const row = this.db.prepare(`SELECT data FROM ${this.table(table)} WHERE id=?`).get(id); return row ? JSON.parse(row.data) : null; }
   put(table, value) { this.db.prepare(`INSERT INTO ${this.table(table)}(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`).run(value.id, JSON.stringify({ ...value, updatedAt: this.stamp() })); }
@@ -121,6 +126,13 @@ export class WorkflowEngine {
     fail('SOURCE_SCHEMA_CHANGED_DURING_READ');
   }
   async readSourceView(id) { return this.readSource(id); }
+  isSalesEvent(event) {
+    return typeof this.mirror?.feedbackForRecord === 'function' && this.config.members.some(member =>
+      member.target?.appToken === event?.appToken && member.target?.tableId === event?.tableId);
+  }
+  pendingEvents() {
+    return [...this.all('v2_inbox'), ...this.all('v2_sales_inbox')].filter(event => event.state === 'pending');
+  }
   acceptEvent(event) {
     if (this.closed) fail('ENGINE_CLOSED');
     const staff=this.config.staffManagement;
@@ -130,9 +142,19 @@ export class WorkflowEngine {
       this.db.prepare('INSERT INTO v2_staff_runtime_events(id,data) VALUES(?,?)').run(event.id,JSON.stringify({id:event.id,state:'pending',recordIds:[...new Set(event.recordIds)],receivedAt:this.stamp()}));
       return true;
     }
-    if (!event || event.appToken !== this.config.appToken || event.tableId !== this.config.tableIds.leads || typeof event.id !== 'string' || !event.id || event.id.length > 300 || !Array.isArray(event.recordIds) || event.recordIds.some(id => typeof id !== 'string' || !id || id.length > 300)) return false;
-    if (this.get('v2_inbox', event.id)) return false;
-    this.put('v2_inbox', { id: event.id, recordIds: [...new Set(event.recordIds)], state: 'pending', receivedAt: this.stamp() });
+    if (!event || typeof event.id !== 'string' || !event.id || event.id.length > 300 || !Array.isArray(event.recordIds) || event.recordIds.some(id => typeof id !== 'string' || !id || id.length > 300)) return false;
+    const master = event.appToken === this.config.appToken && event.tableId === this.config.tableIds.leads;
+    if (!master && !this.isSalesEvent(event)) return false;
+    // Created child rows have no feedback to read. Edits and deletions still require a fresh lookup.
+    const actionable = master || !Array.isArray(event.actions) ? null : new Set(event.actions
+      .filter(action => action?.action === 'record_edited' || action?.action === 'record_deleted').map(action => action.recordId));
+    const recordIds = [...new Set(event.recordIds)].filter(id => !actionable || actionable.has(id));
+    if (!master && !recordIds.length) return false;
+    const id = master ? event.id : salesEventKey(event, event.id);
+    const table = master ? 'v2_inbox' : 'v2_sales_inbox';
+    if (this.get(table, id)) return false;
+    this.put(table, { id, recordIds, state: 'pending', receivedAt: this.stamp(),
+      ...(master ? {} : { scope: 'sales', appToken: event.appToken, tableId: event.tableId }) });
     return true;
   }
   staffEvents(){return this.config.staffManagement?.enabled?this.db.prepare('SELECT id,data FROM v2_staff_runtime_events').all().map(row=>JSON.parse(row.data)):[];}
@@ -269,18 +291,30 @@ export class WorkflowEngine {
     this.inFlight = this.runPendingEvents(options).finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
-  async runPendingEvents({ shouldStop = () => false } = {}) {
+  async runPendingEvents({ shouldStop = () => false, shouldDeferSales = () => false } = {}) {
     if (!this.meta('initialized')) fail('INITIALIZATION_REQUIRED');
     if (!this.config.enabled) fail('WORKFLOW_DISABLED');
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
-    const events = this.all('v2_inbox').filter(event => event.state === 'pending')
+    const queued = this.pendingEvents()
       .sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)) || a.id.localeCompare(b.id));
-    const recordIds = [...new Set(events.flatMap(event => event.recordIds
+    const masterEvents = queued.filter(event => !salesEvent(event));
+    const recordIds = [...new Set(masterEvents.flatMap(event => event.recordIds
       .filter(id => !(event.processedRecordIds || []).includes(id) && !(event.retryAtByRecord?.[id] > this.now()))))].slice(0, 10);
-    if (!recordIds.length || stopped(shouldStop)) return { processed: 0, errors: [] };
+    const salesEvents = queued.filter(salesEvent);
+    const salesRecords = new Map();
+    for (const event of salesEvents) {
+      for (const id of event.recordIds) {
+        if ((event.processedRecordIds || []).includes(id) || event.retryAtByRecord?.[id] > this.now()) continue;
+        salesRecords.set(salesEventKey(event, id), { event, id });
+        if (salesRecords.size === 4) break;
+      }
+      if (salesRecords.size === 4) break;
+    }
+    if ((!recordIds.length && !salesRecords.size) || stopped(shouldStop)) return { processed: 0, errors: [] };
     const staff = await this.refreshStaff({ apply: true, shouldStop });
     await this.refreshMembers();
-    const knownLegacy = new Set(this.meta('legacy_known_ids') || []), processed = [], failed = new Set(), reconcile = new Set(), errors = [...(staff.errors || [])];
+    const knownLegacy = new Set(this.meta('legacy_known_ids') || []);
+    const results = new Map(), errors = [...(staff.errors || [])];
     for (const id of recordIds) {
       if (stopped(shouldStop)) break;
       try {
@@ -290,25 +324,74 @@ export class WorkflowEngine {
         if (view) {
           this.observe(view, { baseline: !this.get('v2_snapshots', id) && knownLegacy.has(id) });
           await this.processRecord(id, shouldStop);
-          await this.drain(shouldStop, task => task.recordId === id && task.state === 'pending' && task.attempts === 0);
         }
-        if (!view?.owner || !this.config.members.some(member => member.openId === view.owner && member.target)) reconcile.add(id);
+        const latest = this.get('v2_snapshots', id);
+        const [needsOperator, notice] = await Promise.allSettled([
+          latest ? this.syncOperatorRecord(latest, staff, shouldStop, errors) : Boolean(this.operatorMirror),
+          view ? this.drain(shouldStop, task => task.recordId === id && task.state === 'pending' && task.attempts === 0, { contactFirst: true }) : undefined,
+        ]);
+        if (notice.status === 'rejected') throw notice.reason;
+        if (needsOperator.status === 'rejected') throw needsOperator.reason;
         if (stopped(shouldStop)) break;
-        processed.push(id);
-      } catch (error) { failed.add(id); errors.push({ code: safeCode(error) }); }
+        results.set(id, { needsSales: !view?.owner || !this.config.members.some(member => member.openId === view.owner && member.target),
+          needsOperator: needsOperator.value });
+      } catch (error) { results.set(id, { failed: true }); errors.push({ code: safeCode(error) }); }
     }
+    this.settleRecordEvents(masterEvents, results);
+    const salesResults = new Map();
+    for (const [key, { event, id }] of salesRecords) {
+      if (stopped(shouldStop) || stopped(shouldDeferSales)) break;
+      try {
+        if (!this.isSalesEvent(event)) { salesResults.set(key, { needsSales: true }); continue; }
+        const result = await this.mirror.feedbackForRecord({ appToken: event.appToken, tableId: event.tableId, targetRecordId: id, shouldStop });
+        if (stopped(shouldStop)) break;
+        const confirmed = await this.notifyConfirmedMirrorStatuses(result?.statusSources || [], shouldStop);
+        if (confirmed.size) this.setMeta('mirror_rescan_needed', true);
+        let needsOperator = false;
+        for (const sourceId of confirmed) {
+          needsOperator = await this.syncOperatorRecord(this.get('v2_snapshots', sourceId), staff, shouldStop, errors) || needsOperator;
+        }
+        if (stopped(shouldStop)) break;
+        salesResults.set(key, { needsSales: result?.needsReconciliation === true, needsOperator });
+      } catch (error) {
+        if (stopped(shouldStop)) break;
+        salesResults.set(key, { failed: true }); errors.push({ code: safeCode(error) });
+      }
+    }
+    this.settleRecordEvents(salesEvents, salesResults);
+    return { processed: [...results.values(), ...salesResults.values()].filter(result => !result.failed).length, errors, stopped: stopped(shouldStop) };
+  }
+  settleRecordEvents(events, results) {
     for (const event of events) {
-      const processedRecordIds = [...new Set([...(event.processedRecordIds || []), ...processed.filter(id => event.recordIds.includes(id))])];
-      const failures = event.recordIds.filter(id => failed.has(id));
-      if (processedRecordIds.length === (event.processedRecordIds || []).length && !failures.length) continue;
-      const retryAtByRecord = Object.fromEntries(Object.entries(event.retryAtByRecord || {}).filter(([id]) => !processed.includes(id)));
-      for (const id of failures) retryAtByRecord[id] = this.now() + 30_000;
+      const processedRecordIds = [...(event.processedRecordIds || [])], retryAtByRecord = { ...event.retryAtByRecord };
+      let changed = false, requiresReconciliation = event.requiresReconciliation === true, requiresOperatorReconciliation = event.requiresOperatorReconciliation === true;
+      for (const id of event.recordIds) {
+        if (processedRecordIds.includes(id)) continue;
+        const result = results.get(salesEvent(event) ? salesEventKey(event, id) : id);
+        if (!result) continue;
+        changed = true;
+        if (result.failed) { retryAtByRecord[id] = this.now() + 30_000; continue; }
+        processedRecordIds.push(id); delete retryAtByRecord[id];
+        requiresReconciliation ||= result.needsSales === true;
+        requiresOperatorReconciliation ||= result.needsOperator === true;
+      }
+      if (!changed) continue;
       const done = event.recordIds.every(id => processedRecordIds.includes(id));
-      const requiresReconciliation = event.requiresReconciliation === true || event.recordIds.some(id => reconcile.has(id));
-      this.put('v2_inbox', { ...event, processedRecordIds, retryAtByRecord, requiresReconciliation,
-        state: done && !requiresReconciliation ? 'done' : 'pending', ...(done && !requiresReconciliation ? { processedAt: this.stamp() } : {}) });
+      const settled = done && !requiresReconciliation && !requiresOperatorReconciliation;
+      this.put(eventTable(event), { ...event, processedRecordIds, retryAtByRecord, requiresReconciliation, requiresOperatorReconciliation,
+        state: settled ? 'done' : 'pending', ...(settled ? { processedAt: this.stamp() } : {}) });
     }
-    return { processed: processed.length, errors, stopped: stopped(shouldStop) };
+  }
+  async syncOperatorRecord(snapshot, staff, shouldStop, errors) {
+    if (!this.operatorMirror) return false;
+    if (snapshot?.deleted || !snapshot?.view || staff.healthy !== true || typeof this.operatorMirror.syncRecord !== 'function' || stopped(shouldStop)) return true;
+    try {
+      const result = await this.operatorMirror.syncRecord(snapshot.view, { operators: this.staff.operatorCandidates(), shouldStop });
+      return result?.synced !== true || result?.needsReconciliation === true;
+    } catch (error) {
+      if (!stopped(shouldStop)) errors.push({ code: safeCode(error) });
+      return true;
+    }
   }
   syncDeferredSalesDetails(options = {}) {
     if (this.closed) return Promise.reject(new WorkflowError('ENGINE_CLOSED'));
@@ -371,16 +454,21 @@ export class WorkflowEngine {
     if (typeof shouldStop !== 'function') fail('STOP_CALLBACK_INVALID');
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
     if (apply) { this.attachmentsReady = false; if (!this.mirror?.hasPendingDetails) this.salesDetailsReady = false; }
-    const acknowledgedEvents = apply ? this.all('v2_inbox').filter(event => event.state === 'pending').map(event => event.id) : [];
+    const acknowledgedEvents = apply ? this.pendingEvents() : [];
     const acknowledgedStaffEvents=apply?this.staffEvents().filter(event=>event.state==='pending').map(event=>event.id):[];
+    const interrupted = () => ({ ok: true, apply, scanned: 0, counts: {}, errors: [], plans: [], stopped: true,
+      salesDetailsReady: apply && this.salesDetailsReady, needsRescan: Boolean(this.meta('mirror_rescan_needed')), nextRetryAt: this.nextRetryAt() });
     const staffResult=await this.refreshStaff({apply,shouldStop});
     if (staffResult.healthy === false) this.salesDetailsReady = false;
+    if (stopped(shouldStop)) return interrupted();
     await this.refreshMembers({ persist: apply });
-    const resolved = await this.resolveSource(), records = await listAll(this.client, this.config.tableIds.leads);
+    if (stopped(shouldStop)) return interrupted();
+    const resolved = await this.resolveSource(), records = await listAll(this.client, this.config.tableIds.leads, shouldStop);
+    if (!records || stopped(shouldStop)) return interrupted();
     // A rename during pagination must not turn an existing owner into an apparent blank.
     if (digest(resolved) !== digest(await this.resolveSource())) fail('SOURCE_SCHEMA_CHANGED_DURING_SCAN');
     const plans = [], sourceViews = [], errors = [...(staffResult.errors||[])], present = new Set(records.map(record => record.record_id));
-    let mirrorReconciled = false;
+    let mirrorReconciled = false, operatorReconciled = false;
     const knownLegacy = new Set(this.meta('legacy_known_ids') || []);
     const eventRecordIds = new Set(this.all('v2_inbox').filter(event => event.state === 'pending').flatMap(event => event.recordIds));
     const orderedRecords = [...records.filter(record => eventRecordIds.has(record.record_id)), ...records.filter(record => !eventRecordIds.has(record.record_id))];
@@ -392,7 +480,7 @@ export class WorkflowEngine {
         const old = this.get('v2_snapshots', view.id);
         this.observe(view, { baseline: !old && knownLegacy.has(view.id) });
         await this.processRecord(view.id, shouldStop);
-        await this.drain(shouldStop, task => task.recordId === view.id && task.state === 'pending' && task.attempts === 0);
+        await this.drain(shouldStop, task => task.recordId === view.id && task.state === 'pending' && task.attempts === 0, { contactFirst: true });
       } catch (error) {
         errors.push({ code: safeCode(error) });
         if (apply) this.review(record.record_id, safeCode(error));
@@ -407,7 +495,7 @@ export class WorkflowEngine {
           const allowDetailsStaging = sourceViews.length === records.length && staffResult.healthy === true;
           const result = await this.mirror.sync({ shouldStop, deferDetails: deferSalesDetails, allowDetailsStaging,
             sourceViews: this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => snapshot.view) });
-          mirrorReconciled = !result?.stopped && !(result?.reviews > 0);
+          mirrorReconciled = !result?.stopped && !(result?.reviews > 0) && sourceViews.length === records.length;
           const staged = deferSalesDetails && this.mirror.detailEnabled === true && !result?.stopped && allowDetailsStaging && !stopped(shouldStop);
           if (staged) this.salesDetailsReady = true;
           if (this.mirror.hasPendingDetails) this.salesDetailsReady = this.salesDetailsReady && this.mirror.hasPendingDetails();
@@ -423,6 +511,7 @@ export class WorkflowEngine {
           const operators = this.staff.operatorCandidates();
           const latestViews = new Map(this.all('v2_snapshots').filter(snapshot => !snapshot.deleted).map(snapshot => [snapshot.id, snapshot.view]));
           const result = await this.operatorMirror.sync(sourceViews.map(view => latestViews.get(view.id) ?? view), { operators, shouldStop });
+          operatorReconciled = !result.stopped && !result.pending && !result.revocationBacklog && !result.reviews;
           const byPerson = new Map(operators.map(operator => [operator.openId, operator]));
           const urls = (result.readyUrls || []).flatMap(({ openId, url }) => byPerson.has(openId)
             ? [{ ...byPerson.get(openId), url }] : []);
@@ -437,14 +526,16 @@ export class WorkflowEngine {
         }
       }
       if (!stopped(shouldStop)) {
-        for (const id of acknowledgedEvents) {
-          const event = this.get('v2_inbox', id);
+        for (const accepted of acknowledgedEvents) {
+          const table = eventTable(accepted);
+          const event = this.get(table, accepted.id);
           if (event?.state !== 'pending') continue;
-          if (event.requiresReconciliation && !mirrorReconciled) {
-            this.put('v2_inbox', { ...event, reconciliationRetryAt: this.now() + 30_000 });
+          const salesNeedsFull = salesEvent(event) || event.requiresReconciliation;
+          if (salesNeedsFull && !mirrorReconciled || event.requiresOperatorReconciliation && !operatorReconciled) {
+            this.put(table, { ...event, reconciliationRetryAt: this.now() + 30_000 });
             continue;
           }
-          this.put('v2_inbox', { ...event, state: 'done', requiresReconciliation: false, processedAt: this.stamp() });
+          this.put(table, { ...event, state: 'done', requiresReconciliation: false, requiresOperatorReconciliation: false, processedAt: this.stamp() });
         }
         if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
       }
@@ -606,11 +697,13 @@ export class WorkflowEngine {
       confirmed.add(view.id);
     }
     if (confirmed.size) await this.drain(shouldStop, task => task.kind === 'status' && confirmed.has(task.recordId));
+    return confirmed;
   }
-  async drain(shouldStop, select = () => true) {
+  async drain(shouldStop, select = () => true, { contactFirst = false } = {}) {
     if (!this.config.notification.enabled) return;
     const due = this.all('v2_outbox').filter(task => pending(task) && (!task.nextAttemptAt || task.nextAttemptAt <= this.now()) && select(task))
-      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id));
+      .sort((a, b) => (contactFirst ? Number(b.kind === 'contact') - Number(a.kind === 'contact') : 0) ||
+        String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id));
     const firstAttempts = due.filter(task => task.state === 'pending' && task.attempts === 0).slice(0, 10);
     const reserved = new Set(firstAttempts.map(task => task.id));
     const tasks = [...firstAttempts, ...due.filter(task => !reserved.has(task.id)).slice(0, 50 - firstAttempts.length)];
@@ -719,7 +812,7 @@ export class WorkflowEngine {
   nextRetryAt() {
     const due = [];
     if (this.meta('mirror_rescan_needed')) due.push(this.now() + 1000);
-    for (const event of this.all('v2_inbox').filter(event => event.state === 'pending')) {
+    for (const event of this.pendingEvents()) {
       const remaining = event.recordIds.filter(id => !(event.processedRecordIds || []).includes(id));
       if (!remaining.length) due.push(Math.max(this.now() + 1000, event.reconciliationRetryAt || 0));
       for (const id of remaining) due.push(Math.max(this.now() + 1000, event.retryAtByRecord?.[id] || 0));
@@ -743,7 +836,7 @@ export class WorkflowEngine {
     for (const snapshot of this.all('v2_snapshots')) records[snapshot.phase] = (records[snapshot.phase] || 0) + 1;
     for (const task of this.all('v2_outbox')) notifications[task.state] = (notifications[task.state] || 0) + 1;
     return { initialized: Boolean(this.meta('initialized')), busy: Boolean(this.inFlight), records, notifications, counts: { ...Object.fromEntries(Object.entries(records).map(([key, value]) => [`records_${key}`, value])), ...Object.fromEntries(Object.entries(notifications).map(([key, value]) => [`notifications_${key}`, value])) },
-      reviews: this.all('v2_reviews').filter(review => review.state === 'open').length, eventsPending: this.all('v2_inbox').filter(event => event.state === 'pending').length,
+      reviews: this.all('v2_reviews').filter(review => review.state === 'open').length, eventsPending: this.pendingEvents().length,
       staffEventsPending:this.staffEvents().filter(event=>event.state==='pending').length,
       nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: { ...this.meta('mirror_status'), ...this.meta('sales_detail_status') },
       salesDetailsReady: this.salesDetailsReady && !this.staffFailure, salesDetails: this.meta('sales_detail_status') || {},

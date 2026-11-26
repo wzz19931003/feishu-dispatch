@@ -178,7 +178,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
   // This guard must run before opening a database, connecting WS, or calling an API.
   assertActivation(config, host);
   const lease = acquireLock(root); // Reuse v1's lock: v1 and v2 cannot run together on this host.
-  let engine, events, timer, watcher, eventStart, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '', eventErrorCode = '', masterEventGeneration = 0;
+  let engine, events, timer, watcher, eventStart, stopping = false, phase = 'starting', dirty = true, nextScan = Date.now(), retryEventsAt = 0, lastErrorCode = '', eventErrorCode = '', masterEventGeneration = 0, priorityEventGeneration = 0;
   let detailController = null, detailsAvailable = false, detailsPendingSince = null, nextDetailsAt = 0, lastIdleTask = 'attachments';
   let fullScanPreemptions = 0, lastFullScanAt = Date.now();
   const wake = () => { dirty = true; detailController?.abort(); };
@@ -192,7 +192,7 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
     client ||= new WorkflowClient(config);
     engine = await makeEngine(config, { root, client, enableAttachmentRuntime: true });
     if (!engine.status().initialized) fail('WORKFLOW_INITIALIZATION_REQUIRED');
-    events = new Events(engine.config || config);
+    events = new Events(engine.config || config, { currentConfig: () => engine.config || config });
     const configStamp=()=>{const value=statSync(path.join(root,'config.workflow.local.json'));return `${value.mtimeMs}/${value.size}`;};
     let previousConfigStamp=configStamp();
     timer = setInterval(() => { try { snapshot(); } catch { stop(); } }, 5000);
@@ -213,12 +213,11 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
           if (shouldStop()) return;
           await events.start(async event => {
             const accepted = await engine.acceptEvent?.(event);
+            if (!accepted) return;
             const source = engine.config || config;
             const master = event.appToken === source.appToken && event.tableId === source.tableIds?.leads;
-            const staff = source.staffManagement;
-            const roster = staff?.enabled && event.appToken === staff.appToken && event.tableId === staff.tableId;
-            if (accepted === false && (master || roster)) return;
-            if (accepted && master) masterEventGeneration++;
+            if (master) masterEventGeneration++;
+            if (master || engine.isSalesEvent?.(event)) priorityEventGeneration++;
             wake();
           });
           eventErrorCode = '';
@@ -228,15 +227,15 @@ export async function run(config, { root = ROOT, host = hostname(), client, Even
       if (dirty || Date.now() >= nextScan) {
         dirty = false; phase = 'scanning'; snapshot();
         try {
-          const beforeQuick = masterEventGeneration;
-          await engine.processPendingEvents?.({ shouldStop });
+          const beforeQuick = priorityEventGeneration, masterBeforeQuick = masterEventGeneration;
+          await engine.processPendingEvents?.({ shouldStop, shouldDeferSales: () => masterEventGeneration !== masterBeforeQuick });
           if (shouldStop()) break;
           const fullRequired = fullScanPreemptions >= MAX_FULL_SCAN_PREEMPTIONS || Date.now() - lastFullScanAt >= MAX_FULL_SCAN_DEFERRAL_MS;
-          if (masterEventGeneration !== beforeQuick && !fullRequired && !shouldStop()) { fullScanPreemptions++; continue; }
+          if (priorityEventGeneration !== beforeQuick && !fullRequired && !shouldStop()) { fullScanPreemptions++; continue; }
           dirty = false;
-          const scanGeneration = masterEventGeneration;
+          const scanGeneration = priorityEventGeneration;
           const result = await engine.scan({ apply: true,
-            shouldStop: () => shouldStop() || !fullRequired && masterEventGeneration !== scanGeneration, deferSalesDetails: true });
+            shouldStop: () => shouldStop() || !fullRequired && priorityEventGeneration !== scanGeneration, deferSalesDetails: true });
           if (result?.stopped && !shouldStop()) fullScanPreemptions++;
           else if (result?.ok === true && !result.stopped) { fullScanPreemptions = 0; lastFullScanAt = Date.now(); }
           const detailState = engine.status();

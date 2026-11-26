@@ -127,6 +127,200 @@ function fixture(t, extra = {}) {
   return { config, db, client, sources, mirror, reads, make, views, setReadHook(value) { readHook = value; } };
 }
 
+test('single-record sync publishes promptly in a ready table without changing other mappings or full-scan status', async t => {
+  const f = fixture(t);
+  for (const view of [lead(1), lead(2, operatorB.openId)]) f.sources.set(view.id, view);
+  await f.mirror.sync(f.views(), { operators: [operatorA, operatorB] });
+  const history = clone(f.mirror.all('copies')), status = clone(f.mirror.status());
+  const cursor = f.db.prepare("SELECT value FROM v2_operator_meta WHERE key='next_operator'").get().value;
+  const view = lead(3); f.sources.set(view.id, view);
+  f.client.calls.length = 0; f.reads.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA, operatorB] }), { synced: true });
+  assert.equal(f.client.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(f.client.calls.some(call => ['base', 'table', 'sharing', 'grant', 'PUT', 'DELETE'].includes(call.method)), false);
+  assert.ok(f.reads.length > 0); assert.ok(f.reads.every(id => id === view.id));
+  const resource = f.mirror.resource(operatorA.openId);
+  assert.ok(f.client.calls.every(call => call.token === resource.baseToken));
+  for (const row of history) assert.deepEqual(f.mirror.all('copies').find(item => item.id === row.id), row);
+  assert.deepEqual(f.mirror.status(), status);
+  assert.equal(f.db.prepare("SELECT value FROM v2_operator_meta WHERE key='next_operator'").get().value, cursor);
+  const row = f.mirror.liveCopies(view.id)[0];
+  f.client.calls.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: true });
+  assert.equal(f.client.calls.some(call => ['POST', 'PUT', 'DELETE'].includes(call.method)), false);
+  view.wxStatus = '未通过';
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: true });
+  assert.equal(f.mirror.liveCopies(view.id)[0].targetRecordId, row.targetRecordId);
+  assert.equal(f.client.calls.filter(call => call.method === 'PUT').length, 1);
+  assert.equal(f.client.bases.get(resource.baseToken).records.get(row.targetRecordId).fields.微信状态, '未通过');
+});
+
+test('single-record sync never provisions missing or incomplete resources and never guesses an operator', async t => {
+  const f = fixture(t), view = lead(1); f.sources.set(view.id, view);
+  const pending = { synced: false, needsReconciliation: true };
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), pending);
+  for (const stage of ['base_needed', 'sharing_needed', 'table_needed', 'member_needed', 'verify', 'review']) {
+    f.mirror.save('resources', { id: operatorA.openId, stage });
+    assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), pending);
+  }
+  assert.deepEqual(await f.mirror.syncRecord({ ...view, operator: '' }, { operators: [] }), pending);
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [] }), pending);
+  assert.equal(f.client.calls.length, 0); assert.equal(f.mirror.all('copies').length, 0);
+  await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA, operatorA] }), { code: 'OPERATOR_ROSTER_INVALID' });
+  await assert.rejects(f.mirror.syncRecord({ ...view, id: '../wrong' }, { operators: [operatorA] }), { code: 'OPERATOR_SOURCE_SNAPSHOT_INVALID' });
+});
+
+test('single-record transfer revokes only its old operator copy before creating the new one', async t => {
+  const f = fixture(t), view = lead(1), other = lead(2);
+  f.sources.set(view.id, view); f.sources.set(other.id, other);
+  await f.mirror.sync(f.views(), { operators: [operatorA, operatorB] });
+  const unchanged = clone(f.mirror.liveCopies(other.id));
+  view.operator = operatorB.openId; f.client.calls.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorB] }), { synced: true });
+  assert.deepEqual(f.client.calls.filter(call => ['POST', 'PUT', 'DELETE'].includes(call.method)).map(call => call.method), ['DELETE', 'POST']);
+  assert.deepEqual(f.mirror.liveCopies(other.id), unchanged);
+  assert.equal(f.mirror.liveCopies(view.id)[0].operatorId, operatorB.openId);
+});
+
+test('single-record clearing requests full reconciliation instead of treating other records as absent', async t => {
+  const f = fixture(t), view = lead(1), other = lead(2);
+  f.sources.set(view.id, view); f.sources.set(other.id, other);
+  await f.mirror.sync(f.views(), { operators: [operatorA] });
+  view.operator = ''; f.client.calls.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: false, needsReconciliation: true });
+  assert.equal(f.client.calls.length, 0); assert.equal(f.mirror.liveCopies(view.id).length, 1);
+  const result = await f.mirror.sync(f.views(), { operators: [operatorA] });
+  assert.equal(result.revoked, 1); assert.equal(f.mirror.liveCopies(other.id).length, 1);
+});
+
+test('single-record cleanup removes only its restored tombstone and keeps child IDs scoped to their Base', async t => {
+  const f = fixture(t), view = lead(1);
+  f.sources.set(view.id, view); await f.mirror.sync(f.views(), { operators: [operatorA, operatorB] });
+  const old = clone(f.mirror.liveCopies(view.id)[0]);
+  view.operator = operatorB.openId;
+  await f.mirror.sync(f.views(), { operators: [operatorA, operatorB] });
+  const current = f.mirror.liveCopies(view.id)[0], beforeId = current.targetRecordId;
+  const oldResource = f.mirror.resource(operatorA.openId), currentResource = f.mirror.resource(operatorB.openId);
+  const oldBase = f.client.bases.get(oldResource.baseToken), currentBase = f.client.bases.get(currentResource.baseToken);
+  // The same textual record ID in another Base must not erase the current snapshot entry.
+  f.mirror.save('copies', { ...old, state: 'revoked', targetRecordId: beforeId });
+  oldBase.records.set(beforeId, clone(currentBase.records.get(beforeId)));
+  f.client.calls.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorB] }), { synced: true });
+  assert.deepEqual(f.client.calls.filter(call => ['POST', 'PUT', 'DELETE'].includes(call.method)).map(call => [call.method, call.token]), [['DELETE', oldResource.baseToken]]);
+  assert.equal(currentBase.records.has(beforeId), true); assert.equal(oldBase.records.has(beforeId), false);
+  assert.equal(f.mirror.liveCopies(view.id)[0].targetRecordId, beforeId);
+});
+
+test('single-record creation keeps unknown outcomes in review across restart without another POST', async t => {
+  const f = fixture(t), view = lead(1);
+  await f.mirror.sync([], { operators: [operatorA] }); f.sources.set(view.id, view);
+  f.client.hook = phase => { if (phase === 'after-create') throw error('NETWORK_OR_TIMEOUT'); };
+  await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA] }), { code: 'NETWORK_OR_TIMEOUT' });
+  assert.equal(f.mirror.liveCopies(view.id)[0].state, 'review');
+  f.client.hook = null;
+  await assert.rejects(f.make().syncRecord(view, { operators: [operatorA] }), { code: 'OPERATOR_UNTRUSTED_CHILD_RECORD' });
+  assert.equal(f.client.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal([...f.client.bases.values()][0].records.size, 1);
+});
+
+test('single-record no-write rejection keeps the planned idempotency token for a later safe attempt', async t => {
+  let allowed = true;
+  const f = fixture(t, { verifyOperator: async () => allowed }), view = lead(1);
+  await f.mirror.sync([], { operators: [operatorA] }); f.sources.set(view.id, view);
+  let reads = 0;
+  f.setReadHook(() => { if (++reads === 3) allowed = false; });
+  await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA] }), { code: 'OPERATOR_NOT_READY' });
+  const planned = f.mirror.liveCopies(view.id)[0];
+  assert.equal(planned.state, 'planned'); assert.equal(f.client.recordSequence, 0);
+  f.setReadHook(null); allowed = true;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: true });
+  assert.equal(f.client.recordSequence, 1);
+  assert.equal(f.mirror.liveCopies(view.id)[0].token, planned.token);
+  assert.equal(f.client.calls.find(call => call.method === 'POST').clientToken, planned.token);
+});
+
+test('single-record writes retain immediate ACL, employee, schema and local-switch guards', async t => {
+  for (const change of ['acl', 'employee', 'schema', 'local']) {
+    let allowed = true, live = true;
+    const f = fixture(t, { verifyOperator: async () => allowed, assertLiveConfig: async () => { if (!live) throw error('OPERATOR_LOCAL_CHANGED'); } });
+    await f.mirror.sync([], { operators: [operatorA] });
+    const view = lead(1); f.sources.set(view.id, view);
+    const resource = f.mirror.resource(operatorA.openId);
+    let changed = false;
+    f.client.hook = (phase, { base }) => {
+      if (phase !== 'GET:records' || changed) return; changed = true;
+      if (change === 'acl') base.members.push({ memberType: 'openid', openId: operatorB.openId, perm: 'view' });
+      if (change === 'employee') allowed = false;
+      if (change === 'local') live = false;
+      if (change === 'schema') {
+        base.fields.find(field => field.field_name === '微信号').field_name = '改名微信号';
+        base.fields.push({ field_id: 'fldUnrelatedWechat123', field_name: '微信号', type: 1 });
+      }
+    };
+    const code = { acl: 'OPERATOR_UNKNOWN_COLLABORATOR', employee: 'OPERATOR_NOT_READY', schema: 'OPERATOR_SCHEMA_CHANGED_DURING_READ', local: 'OPERATOR_LOCAL_CHANGED' }[change];
+    await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA] }), { code });
+    assert.equal(f.client.bases.get(resource.baseToken).records.size, 0);
+    assert.equal(f.client.calls.filter(call => ['POST', 'PUT', 'DELETE'].includes(call.method)).length, 0);
+  }
+});
+
+test('single-record changed source attribution or deletion is held without writing the stale target', async t => {
+  for (const change of ['operator', 'deleted']) {
+    const f = fixture(t); await f.mirror.sync([], { operators: [operatorA] });
+    const view = lead(1); f.sources.set(view.id, view);
+    f.setReadHook(() => { if (change === 'operator') view.operator = operatorB.openId; else f.sources.delete(view.id); });
+    assert.deepEqual(await f.mirror.syncRecord(clone(view), { operators: [operatorA] }), { synced: false, needsReconciliation: true });
+    assert.equal(f.client.calls.some(call => ['POST', 'PUT', 'DELETE'].includes(call.method)), false);
+  }
+});
+
+test('single-record transfer debits deletion from the write quota before allowing new exposure', async t => {
+  const f = fixture(t, { maxWrites: 1 }), view = lead(1);
+  f.sources.set(view.id, view); await f.mirror.sync(f.views(), { operators: [operatorA, operatorB] });
+  view.operator = operatorB.openId; f.client.calls.length = 0;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorB] }), { synced: false, needsReconciliation: true });
+  assert.deepEqual(f.client.calls.filter(call => ['POST', 'PUT', 'DELETE'].includes(call.method)).map(call => call.method), ['DELETE']);
+  assert.equal((await f.mirror.sync(f.views(), { operators: [operatorB] })).created, 1);
+});
+
+test('single-record target loss or unknown child rows cannot establish a replacement mapping', async t => {
+  for (const change of ['missing', 'unknown']) {
+    const f = fixture(t), view = lead(1); f.sources.set(view.id, view);
+    await f.mirror.sync(f.views(), { operators: [operatorA] });
+    const resource = f.mirror.resource(operatorA.openId), base = f.client.bases.get(resource.baseToken);
+    if (change === 'missing') base.records.clear();
+    else base.records.set('recUntrustedOperator123', { record_id: 'recUntrustedOperator123', fields: {} });
+    f.client.calls.length = 0;
+    await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA] }), { code: change === 'missing' ? 'OPERATOR_CHILD_MISSING' : 'OPERATOR_UNTRUSTED_CHILD_RECORD' });
+    assert.equal(f.client.calls.some(call => ['POST', 'PUT', 'DELETE'].includes(call.method)), false);
+  }
+});
+
+test('single-record success requires actual matching child fields rather than just an accepted create ID', async t => {
+  const f = fixture(t), view = lead(1);
+  await f.mirror.sync([], { operators: [operatorA] }); f.sources.set(view.id, view);
+  f.client.hook = (phase, { record }) => { if (phase === 'after-create') delete record.fields.微信号; };
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: false, needsReconciliation: true });
+  assert.equal(f.mirror.liveCopies(view.id)[0].state, 'active');
+  f.client.hook = null;
+  assert.deepEqual(await f.mirror.syncRecord(view, { operators: [operatorA] }), { synced: true });
+  assert.equal(f.client.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(f.client.calls.filter(call => call.method === 'PUT').length, 1);
+});
+
+test('single-record calls are exclusive with full scans and stop before cloud mutation', { timeout: 5000 }, async t => {
+  const f = fixture(t), view = lead(1); await f.mirror.sync([], { operators: [operatorA] }); f.sources.set(view.id, view);
+  await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA], shouldStop: () => true }), { code: 'OPERATOR_STOP_REQUESTED' });
+  let release, entered, blocked = false;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  f.client.hook = async phase => { if (phase === 'GET:records' && !blocked) { blocked = true; entered(); await new Promise(resolve => { release = resolve; }); } };
+  const running = f.mirror.syncRecord(view, { operators: [operatorA] }); await waiting;
+  await assert.rejects(f.mirror.syncRecord(view, { operators: [operatorA] }), { code: 'OPERATOR_MIRROR_BUSY' });
+  await assert.rejects(f.mirror.sync(f.views(), { operators: [operatorA] }), { code: 'OPERATOR_MIRROR_BUSY' });
+  release(); assert.deepEqual(await running, { synced: true }); assert.equal(f.mirror.status().busy, false);
+});
+
 test('silently backfills historical intake only into the correct independent read-only operator Base', async t => {
   const f = fixture(t);
   f.sources.set('recOperatorLead1123', lead(1));

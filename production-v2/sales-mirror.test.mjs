@@ -53,7 +53,7 @@ class FakeClient {
   }
 }
 
-function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, salesDetails, detailBudgetMs, now } = {}) {
+function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailColumns = false, firstWriteDetails = false, salesDetails, detailBudgetMs, now } = {}) {
   const log = [], source = new FakeClient(sourceToken, 'tblSourceFixture001', schema('Source'), log);
   const childSchema = schema('Child').filter(field => !['owner', 'operator'].includes(field.key));
   const salesA = new FakeClient('SalesAFixtureBase012345', 'tblSalesAFixture001', childSchema, log);
@@ -84,7 +84,11 @@ function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailC
   const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource, detailBudgetMs, now,
     assertLiveConfig: () => hooks.assertLiveConfig?.(),
     operatorNames: () => hooks.staffUnhealthy ? null : new Map([['ou_fixture_operator', '离线运营']]),
-    auditDetailsTarget: async (member, stopped, signal) => hooks.auditDetailsTarget?.(member, stopped, signal) ?? true });
+    auditDetailsTarget: async (member, stopped, signal, context) => {
+      // Existing repair tests model rows created before first-write details were available.
+      if (context?.phase === 'create' && !firstWriteDetails) return false;
+      return hooks.auditDetailsTarget?.(member, stopped, signal, context) ?? true;
+    } });
   const mirror = construct();
   return { db, mirror, construct, config, source, salesA, salesB, log, hooks, readSource, resolveSource, close() { db.close(); } };
 }
@@ -804,4 +808,220 @@ test('an unknown feedback update outcome is counted and confirmed by read withou
     const confirmed = await f.mirror.sync(); assert.equal(confirmed.sourceWrites, 0); assert.equal(confirmed.nextRetryAt, null);
     assert.equal(f.log.filter(entry => entry.op === 'update' && entry.base === sourceToken).length, 1);
   } finally { f.close(); }
+});
+
+const exactFeedback = (f, targetRecordId, extra = {}) => f.mirror.feedbackForRecord({
+  appToken: f.salesA.base, tableId: f.salesA.table, targetRecordId, ...extra,
+});
+
+test('first sales POST includes verified date and registered operator with one create and no later scalar PUT', async () => {
+  const f = fixture({ detailColumns: true, firstWriteDetails: true });
+  try {
+    f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    const created = f.log.find(entry => entry.op === 'create');
+    assert.equal(created.fields['日期'], 1_800_000_000_000); assert.equal(created.fields['运营名字'], '离线运营');
+    assert.equal(f.salesA.records.get(targetRecordId).fields['日期'], 1_800_000_000_000);
+    const row = f.mirror.latest('recSource1'); assert.equal(row.detailJob.pending, false);
+    assert.equal(Object.hasOwn(row.baseValues, 'leadDate'), false); assert.equal(Object.hasOwn(row.baseValues, 'operatorName'), false);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM v2_sales_detail_pins').get().n, 1);
+    await f.mirror.sync({ deferDetails: true }); await f.mirror.syncDeferredDetails();
+    assert.equal(createCount(f), 1); assert.equal(f.log.filter(entry => entry.op === 'update').length, 0);
+  } finally { f.close(); }
+});
+
+test('optional create ACL is parallel, deadline bounded and never promotes a late response', async () => {
+  const f = fixture({ detailColumns: true, firstWriteDetails: true, detailBudgetMs: 20 });
+  try {
+    f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+    let started = false, ended = false;
+    f.hooks.auditDetailsTarget = async (_member, _stop, signal, { phase }) => {
+      assert.equal(phase, 'create'); started = true;
+      await delay(65); ended = true; assert.equal(signal.aborted, true); return true;
+    };
+    const original = f.salesA.api.bind(f.salesA);
+    f.salesA.api = async (...args) => { await delay(0); assert.equal(started, true); return original(...args); };
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    assert.equal(ended, false); assert.equal(f.salesA.records.get(targetRecordId).fields['日期'], undefined);
+    assert.equal(f.mirror.latest('recSource1').detailJob.pending, true);
+    await delay(75); assert.equal(createCount(f), 1); assert.equal(f.salesA.records.get(targetRecordId).fields['日期'], undefined);
+  } finally { f.close(); }
+});
+
+test('owner and target schema are re-read after the optional create audit finishes', async () => {
+  const f = fixture({ detailColumns: true, firstWriteDetails: true });
+  try {
+    f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+    f.hooks.auditDetailsTarget = async member => {
+      if (member.id === 'sales_a') owner(f, 'ou_fixture_sales_b'); return true;
+    };
+    const result = await f.mirror.ensure({ id: 'recSource1' });
+    assert.equal(f.salesA.records.size, 0); assert.equal(createCount(f), 1);
+    assert.ok(result.url.includes(f.salesB.base));
+    assert.equal(f.salesB.records.get(result.targetRecordId).fields['运营名字'], '离线运营');
+  } finally { f.close(); }
+});
+
+test('unavailable, replaced or untrusted optional columns fall back to one minimum sales create', async () => {
+  for (const cause of ['denied', 'throws', 'column', 'pin', 'operator']) {
+    const f = fixture({ detailColumns: true, firstWriteDetails: true });
+    try {
+      f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+      if (cause === 'denied') f.hooks.auditDetailsTarget = async () => false;
+      if (cause === 'throws') f.hooks.auditDetailsTarget = async () => { throw new Error('fake ACL outage'); };
+      if (cause === 'column') f.salesA.schema.find(field => field.field_name === '日期').type = 1;
+      if (cause === 'pin') f.db.prepare('INSERT INTO v2_sales_detail_pins VALUES(?,?,?)').run(JSON.stringify([f.salesA.base, f.salesA.table]), 'fldPreviousDate000', 'fldPreviousOperator000');
+      if (cause === 'operator') f.source.records.get('recSource1').fields.Operator = [{ id: 'ou_unknown_operator' }];
+      const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+      const row = f.salesA.records.get(targetRecordId); assert.equal(row.fields.Wechat, 'fixture-wx', cause);
+      assert.equal(row.fields['日期'], undefined, cause); assert.equal(row.fields['运营名字'], undefined, cause); assert.equal(createCount(f), 1, cause);
+    } finally { f.close(); }
+  }
+});
+
+test('initial detail schema change during ACL falls back safely and source activation change still prevents any POST', async () => {
+  const f = fixture({ detailColumns: true, firstWriteDetails: true });
+  try {
+    f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+    f.hooks.auditDetailsTarget = async () => {
+      await delay(1);
+      f.salesA.schema.find(field => field.field_name === '日期').field_id = 'fldReplacementDate999';
+      return true;
+    };
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    assert.equal(f.salesA.records.get(targetRecordId).fields['日期'], undefined);
+    assert.equal(createCount(f), 1);
+  } finally { f.close(); }
+  const disabled = fixture({ detailColumns: true, firstWriteDetails: true });
+  try {
+    disabled.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000;
+    disabled.hooks.assertLiveConfig = () => { disabled.config.enabled = false; };
+    await assert.rejects(disabled.mirror.ensure({ id: 'recSource1' }), { code: 'MIRROR_WRITES_DISABLED' });
+    assert.equal(createCount(disabled), 0); assert.equal(disabled.db.prepare('SELECT COUNT(*) AS n FROM v2_sales_detail_pins').get().n, 0);
+  } finally { disabled.close(); }
+});
+
+test('a detail-inclusive unknown create is held for review without a second base-only POST', async () => {
+  const f = fixture({ detailColumns: true, firstWriteDetails: true });
+  try {
+    f.source.records.get('recSource1').fields['日期'] = 1_800_000_000_000; f.salesA.createUnknown = true;
+    await assert.rejects(f.mirror.ensure({ id: 'recSource1' }), { code: 'MIRROR_CREATE_REVIEW_REQUIRED' });
+    await assert.rejects(f.mirror.ensure({ id: 'recSource1' }), { code: 'MIRROR_CREATE_REVIEW_REQUIRED' });
+    assert.equal(createCount(f), 1); assert.equal(f.mirror.latest('recSource1').state, 'create_review');
+    assert.equal([...f.salesA.records.values()][0].fields['运营名字'], '离线运营');
+  } finally { f.close(); }
+});
+
+test('a positively echoed create can retain a rapid real status edit and reconcile it once by exact record', async () => {
+  const f = fixture();
+  try {
+    f.salesA.hooks.beforeRead = id => { f.salesA.records.get(id).fields['Wechat status'] = '未通过'; };
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' }); delete f.salesA.hooks.beforeRead;
+    assert.equal(f.mirror.latest('recSource1').state, 'active'); assert.equal(f.mirror.latest('recSource1').baseValues.wxStatus, '未添加');
+    const result = await exactFeedback(f, targetRecordId);
+    assert.equal(result.statusSources.length, 1); assert.equal(result.statusSources[0].wxStatus, '未通过');
+    assert.equal(f.source.records.get('recSource1').fields['Wechat status'], '未通过');
+    assert.equal((await exactFeedback(f, targetRecordId)).statusSources.length, 0); assert.equal(createCount(f), 1);
+    assert.equal(f.log.filter(entry => entry.op === 'update' && entry.base === sourceToken).length, 1);
+    assert.equal(f.source.metrics.list + f.salesA.metrics.list + f.salesB.metrics.list, 0);
+  } finally { f.close(); }
+});
+
+test('create confirmation still requires optional feedback values and explicit status evidence rather than missing cells', async () => {
+  for (const cause of ['wx', 'needs', 'partySize', 'missing-status', 'no-echo']) {
+    const f = fixture({ feedbackFields: ['wxStatus', 'wx', 'needs', 'partySize'] });
+    try {
+      f.salesA.hooks.beforeRead = id => {
+        const fields = f.salesA.records.get(id).fields;
+        if (cause === 'wx') fields.Wechat = 'different-fixture-wx';
+        if (cause === 'needs') fields.Needs = 'different-fixture-needs';
+        if (cause === 'partySize') fields['Party size'] = 9;
+        if (cause === 'missing-status') delete fields['Wechat status'];
+        if (cause === 'no-echo') fields['Wechat status'] = '未通过';
+      };
+      if (cause === 'no-echo') { const create = f.salesA.createRecord.bind(f.salesA); f.salesA.createRecord = async (...args) => { const result = await create(...args); delete result.fields['Wechat status']; return result; }; }
+      await assert.rejects(f.mirror.ensure({ id: 'recSource1' }), { code: 'MIRROR_CREATE_CONTENT_UNCONFIRMED' });
+      assert.equal(createCount(f), 1, cause); assert.equal(f.mirror.latest('recSource1').state, 'active', cause);
+    } finally { f.close(); }
+  }
+});
+
+test('targeted feedback accepts only a unique active backend mapping and does not repair global ownership', async () => {
+  const f = fixture();
+  try {
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    const before = clone(f.salesA.metrics);
+    assert.deepEqual(await exactFeedback(f, targetRecordId, { tableId: f.salesB.table }), { statusSources: [], needsReconciliation: true });
+    assert.deepEqual(await exactFeedback(f, targetRecordId, { appToken: f.salesB.base }), { statusSources: [], needsReconciliation: true });
+    assert.deepEqual(await exactFeedback(f, 'recUnknownChild'), { statusSources: [], needsReconciliation: true });
+    assert.deepEqual(f.salesA.metrics, before);
+    owner(f, 'ou_fixture_sales_b'); f.log.length = 0;
+    assert.deepEqual(await exactFeedback(f, targetRecordId), { statusSources: [], needsReconciliation: true });
+    assert.equal(f.log.length, 0); assert.equal(f.salesA.records.size, 1); assert.equal(f.salesB.records.size, 0);
+    const row = f.mirror.latest('recSource1'); f.mirror.put({ ...row, state: 'revoked' });
+    assert.deepEqual(await exactFeedback(f, targetRecordId), { statusSources: [], needsReconciliation: true });
+  } finally { f.close(); }
+});
+
+test('targeted feedback rechecks the child after awaited validation and ignores a rapid B to A reversal', async () => {
+  const f = fixture();
+  try {
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' });
+    f.salesA.records.get(targetRecordId).fields['Wechat status'] = '未通过';
+    let checks = 0;
+    f.hooks.assertLiveConfig = () => { if (++checks === 2) f.salesA.records.get(targetRecordId).fields['Wechat status'] = '未添加'; };
+    f.log.length = 0;
+    const result = await exactFeedback(f, targetRecordId);
+    assert.deepEqual(result, { statusSources: [], needsReconciliation: true });
+    assert.equal(f.source.records.get('recSource1').fields['Wechat status'], '未添加');
+    assert.equal(f.mirror.statusWriteback('recSource1'), null); assert.equal(f.log.length, 0);
+    delete f.hooks.assertLiveConfig;
+    assert.deepEqual(await exactFeedback(f, targetRecordId), { statusSources: [] }); assert.equal(f.log.length, 0);
+  } finally { f.close(); }
+});
+
+test('targeted feedback checks final owner, ACL and stop before any source update', async () => {
+  for (const cause of ['owner', 'acl', 'stop']) {
+    const f = fixture();
+    try {
+      const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' }); f.salesA.records.get(targetRecordId).fields['Wechat status'] = '未通过';
+      let checks = 0, stop = false;
+      if (cause === 'owner') f.hooks.assertLiveConfig = () => { if (++checks === 2) owner(f, 'ou_fixture_sales_b'); };
+      if (cause === 'acl') f.hooks.auditDetailsTarget = async () => false;
+      if (cause === 'stop') f.hooks.assertLiveConfig = () => { if (++checks === 2) stop = true; };
+      f.log.length = 0;
+      if (cause === 'owner') assert.equal((await exactFeedback(f, targetRecordId)).needsReconciliation, true);
+      else await assert.rejects(exactFeedback(f, targetRecordId, { shouldStop: () => stop }), { code: cause === 'acl' ? 'MIRROR_TARGET_ACCESS_UNVERIFIED' : 'MIRROR_STOP_REQUESTED' });
+      assert.equal(f.log.length, 0, cause); assert.equal(f.mirror.statusWriteback('recSource1'), null, cause);
+    } finally { f.close(); }
+  }
+});
+
+test('targeted feedback never replaces a missing child or replays an unknown source update receipt', async () => {
+  const f = fixture();
+  try {
+    const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' }); f.salesA.records.get(targetRecordId).fields['Wechat status'] = '未通过';
+    f.source.hooks.afterUpdate = () => { throw Object.assign(new Error('fake lost acknowledgement'), { code: 'NETWORK_OR_TIMEOUT' }); };
+    await assert.rejects(exactFeedback(f, targetRecordId), { code: 'NETWORK_OR_TIMEOUT' });
+    delete f.source.hooks.afterUpdate;
+    assert.deepEqual(await exactFeedback(f, targetRecordId), { statusSources: [] });
+    assert.equal(f.mirror.statusWriteback('recSource1'), null);
+    assert.equal(f.log.filter(entry => entry.op === 'update' && entry.base === sourceToken).length, 1);
+    f.salesA.records.delete(targetRecordId);
+    assert.equal((await exactFeedback(f, targetRecordId)).needsReconciliation, true); assert.equal(createCount(f), 1);
+  } finally { f.close(); }
+});
+
+test('targeted feedback source and child rename races stop before writing a reused field name', async () => {
+  for (const side of ['source', 'child']) {
+    const f = fixture();
+    try {
+      const { targetRecordId } = await f.mirror.ensure({ id: 'recSource1' }); f.salesA.records.get(targetRecordId).fields['Wechat status'] = '未通过';
+      let reads = 0;
+      f.salesA.hooks.beforeRead = () => { if (++reads === 2) renameAndReuse(side === 'source' ? f.source : f.salesA, 'wxStatus', 'Renamed Targeted Status'); };
+      f.log.length = 0;
+      await assert.rejects(exactFeedback(f, targetRecordId), { code: 'MIRROR_FEEDBACK_SCHEMA_CHANGED' });
+      assert.equal(f.log.length, 0); assert.equal(f.mirror.statusWriteback('recSource1'), null);
+    } finally { f.close(); }
+  }
 });

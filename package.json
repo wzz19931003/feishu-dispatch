@@ -1,6 +1,6 @@
 {
   "name": "feishu-dispatch",
-  "version": "2.3.2",
+  "version": "2.3.3",
   "license": "MIT",
   "private": true,
   "type": "module",
