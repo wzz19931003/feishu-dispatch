@@ -51,6 +51,7 @@ export class WorkflowEngine {
     this.config = validateWorkflowConfig(config); this.client = client || new WorkflowClient(this.config);
     this.memberProvider = memberProvider; this.mirror = mirror || null; this.now = now; this.inFlight = null; this.closed = false;
     this.salesDetailsReady = false;
+    this.startedAt = this.now();
     this.configSignature = stableConfig(this.config);
     const filename = dbPath || this.config.dbPath;
     if (filename !== ':memory:') mkdirSync(path.dirname(path.resolve(filename)), { recursive: true });
@@ -118,13 +119,22 @@ export class WorkflowEngine {
     return fresh.members;
   }
   async resolveSource() { return resolveFields(this.client, { appToken: this.config.appToken, tableId: this.config.tableIds.leads, fields: this.config.fields.leads }); }
-  async readSource(id) {
+  async readSourceWithStatusEdit(id, statusEdit) {
     for (let attempt = 0; attempt < 2; attempt++) {
-      const resolved = await this.resolveSource(), record = await this.client.readRecord(this.config.tableIds.leads, id);
-      if (digest(resolved) === digest(await this.resolveSource())) return recordView(record, resolved);
+      const resolved = await this.resolveSource();
+      const record = await this.client.readRecord(this.config.tableIds.leads, id, statusEdit ? { automaticFields: true } : undefined);
+      if (digest(resolved) !== digest(await this.resolveSource())) continue;
+      const view = recordView(record, resolved);
+      // Verify that this field edit is still the record's current edit by its assigned sales member.
+      // Record snapshots alone cannot establish who changed the field.
+      const confirmed = statusEdit && view.id === id && view.owner === statusEdit.actor && view.wxStatus === statusEdit.to &&
+        this.config.members.some(member => member.openId === view.owner) && record.last_modified_time === statusEdit.editedAt &&
+        (record.last_modified_by?.id ?? record.last_modified_by?.open_id) === statusEdit.actor;
+      return { view, statusEdit: confirmed ? statusEdit : undefined };
     }
     fail('SOURCE_SCHEMA_CHANGED_DURING_READ');
   }
+  async readSource(id) { return (await this.readSourceWithStatusEdit(id)).view; }
   async readSourceView(id) { return this.readSource(id); }
   isSalesEvent(event) {
     return typeof this.mirror?.feedbackForRecord === 'function' && this.config.members.some(member =>
@@ -153,9 +163,29 @@ export class WorkflowEngine {
     const id = master ? event.id : salesEventKey(event, event.id);
     const table = master ? 'v2_inbox' : 'v2_sales_inbox';
     if (this.get(table, id)) return false;
-    this.put(table, { id, recordIds, state: 'pending', receivedAt: this.stamp(),
-      ...(master ? {} : { scope: 'sales', appToken: event.appToken, tableId: event.tableId }) });
+    const statusEditSince = this.meta('master_status_edit_since') ?? this.startedAt;
+    const statusEdits = master && Array.isArray(event.statusEdits) ? event.statusEdits.filter(edit =>
+      edit && recordIds.includes(edit.recordId) && /^ou_[A-Za-z0-9_-]{3,128}$/.test(edit.actor) &&
+      Number.isSafeInteger(edit.revision) && edit.revision > 0 && Number.isSafeInteger(edit.editedAt) && edit.editedAt >= statusEditSince &&
+      typeof edit.from === 'string' && edit.from.length <= 80 && edit.from !== edit.to && operatorNoticeStatuses.has(edit.to))
+      .map(({ recordId, actor, revision, editedAt, from, to }) => ({ recordId, actor, revision, editedAt, from, to })) : [];
+    this.transaction(() => {
+      if (master && this.meta('master_status_edit_since') == null) this.setMeta('master_status_edit_since', statusEditSince);
+      this.put(table, { id, recordIds, state: 'pending', receivedAt: this.stamp(),
+        ...(statusEdits.length ? { statusEdits } : {}),
+        ...(master ? {} : { scope: 'sales', appToken: event.appToken, tableId: event.tableId }) });
+    });
     return true;
+  }
+  pendingStatusEdits(events) {
+    const edits = new Map();
+    for (const event of events) {
+      for (const edit of event.statusEdits ?? []) {
+        if (event.processedRecordIds?.includes(edit.recordId)) continue;
+        if (edit.revision > (edits.get(edit.recordId)?.revision ?? 0)) edits.set(edit.recordId, edit);
+      }
+    }
+    return edits;
   }
   staffEvents(){return this.config.staffManagement?.enabled?this.db.prepare('SELECT id,data FROM v2_staff_runtime_events').all().map(row=>JSON.parse(row.data)):[];}
   async refreshStaff({apply=false,shouldStop=()=>false}={}){
@@ -213,7 +243,9 @@ export class WorkflowEngine {
     return { ok: true, ...this.status() };
   }
   queue(kind, snapshot, extra = {}) {
-    const version = kind === 'owner' ? snapshot.ownerVersion : kind === 'status' ? snapshot.statusVersion : snapshot.contactSignature;
+    const version = kind === 'owner' ? snapshot.ownerVersion : kind === 'status'
+      ? extra.statusEditRevision ? `master:${extra.statusEditRevision}` : snapshot.statusVersion
+      : snapshot.contactSignature;
     const id = digest([snapshot.id, kind, version, kind === 'status' ? snapshot.operatorVersion : '']);
     if (!this.get('v2_outbox', id)) this.put('v2_outbox', { id, recordId: snapshot.id, kind, state: 'pending', owner: snapshot.view.owner, ownerVersion: snapshot.ownerVersion, statusVersion: snapshot.statusVersion,
       contactSignature: snapshot.contactSignature, attempts: 0, nextAttemptAt: 0, createdAt: this.stamp(), ...extra });
@@ -228,7 +260,7 @@ export class WorkflowEngine {
     const receipt = this.mirror?.statusWriteback?.(view.id);
     return receipt?.id && receipt.id !== previous?.statusWritebackId ? receipt : null;
   }
-  observe(view, { baseline = false, phase } = {}) {
+  observe(view, { baseline = false, phase, statusEdit } = {}) {
     return this.transaction(() => {
       const old = this.get('v2_snapshots', view.id), first = !old;
       const ownerChanged = !first && old.view.owner !== view.owner;
@@ -241,6 +273,13 @@ export class WorkflowEngine {
         .find(task => task.recordId === view.id && task.kind === 'status' && task.statusVersion === old.statusVersion && task.statusWritebackId && pending(task));
       const confirmedStatus = notifyStatus && statusChanged && receipt && receipt.owner === view.owner && old.view.owner === view.owner &&
         receipt.from === old.view.wxStatus && receipt.to === view.wxStatus;
+      const confirmedMasterEdit = !baseline && statusEdit &&
+        statusEdit.revision > (old?.statusEditRevision ?? 0);
+      // A personal-table writeback may already have queued this observed transition.
+      const priorStatus = confirmedMasterEdit && old && !statusChanged
+        ? this.get('v2_outbox', digest([view.id, 'status', old.statusVersion, old.operatorVersion])) : null;
+      const priorWritebackNotice = priorStatus?.statusWritebackId && priorStatus.statusFrom === statusEdit.from &&
+        statusEdit.editedAt <= Date.parse(priorStatus.createdAt);
       const contactOnAssignment = this.hasSalesWechat();
       const contactAwaitingOperator = contactOnAssignment && activeContact(view) && operatorChanged && !ownerChanged && this.all('v2_outbox')
         .some(task => task.recordId === view.id && task.kind === 'contact' && task.ownerVersion === old.ownerVersion && pending(task) && !task.delivery);
@@ -251,6 +290,7 @@ export class WorkflowEngine {
         operatorVersion: (old?.operatorVersion || 0) + (operatorChanged ? 1 : 0), wxVersion: (old?.wxVersion || 0) + (wxChanged ? 1 : 0),
         autoEligible: old?.autoEligible ?? !baseline, phase: phase || (view.owner ? 'assigned' : ready(view) ? 'awaiting_sales' : 'awaiting_details'), deleted: false };
       if (receipt) snapshot.statusWritebackId = receipt.id;
+      if (confirmedMasterEdit) snapshot.statusEditRevision = statusEdit.revision;
       if (ownerChanged) {
         this.cancel(view.id, task => ['owner', 'contact'].includes(task.kind), 'OWNER_CHANGED');
         delete snapshot.displayNextAttemptAt;
@@ -268,7 +308,10 @@ export class WorkflowEngine {
       this.put('v2_snapshots', snapshot);
       if (!baseline) {
         if ((first && view.owner) || ownerChanged && view.owner) this.queue('owner', snapshot);
-        if (confirmedStatus || pendingStatus) this.queue('status', snapshot, { statusWritebackId: confirmedStatus ? receipt.id : pendingStatus.statusWritebackId });
+        if (confirmedStatus || pendingStatus) this.queue('status', snapshot, confirmedStatus
+          ? { statusWritebackId: receipt.id, statusFrom: receipt.from }
+          : { statusWritebackId: pendingStatus.statusWritebackId, statusFrom: pendingStatus.statusFrom });
+        else if (confirmedMasterEdit && !priorWritebackNotice) this.queue('status', snapshot, { statusEditRevision: statusEdit.revision });
         if (snapshot.contactSignature && (contactOnAssignment ? first || ownerChanged || addChanged || contactAwaitingOperator : first || old.contactSignature !== snapshot.contactSignature)) this.queue('contact', snapshot);
         if (detailsChanged || operatorChanged) for (const task of this.all('v2_outbox').filter(task => task.recordId === view.id && ['waiting_details', 'waiting_operator'].includes(task.state))) this.put('v2_outbox', { ...task, state: 'pending', nextAttemptAt: 0 });
       }
@@ -298,6 +341,7 @@ export class WorkflowEngine {
     const queued = this.pendingEvents()
       .sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)) || a.id.localeCompare(b.id));
     const masterEvents = queued.filter(event => !salesEvent(event));
+    const statusEdits = this.pendingStatusEdits(masterEvents);
     const recordIds = [...new Set(masterEvents.flatMap(event => event.recordIds
       .filter(id => !(event.processedRecordIds || []).includes(id) && !(event.retryAtByRecord?.[id] > this.now()))))].slice(0, 10);
     const salesEvents = queued.filter(salesEvent);
@@ -318,11 +362,11 @@ export class WorkflowEngine {
     for (const id of recordIds) {
       if (stopped(shouldStop)) break;
       try {
-        let view;
-        try { view = await this.readSource(id); }
+        let view, statusEdit;
+        try { ({ view, statusEdit } = await this.readSourceWithStatusEdit(id, statusEdits.get(id))); }
         catch (error) { if (!missingSource(error)) throw error; this.markMissing(id); }
         if (view) {
-          this.observe(view, { baseline: !this.get('v2_snapshots', id) && knownLegacy.has(id) });
+          this.observe(view, { baseline: !this.get('v2_snapshots', id) && knownLegacy.has(id), statusEdit });
           await this.processRecord(id, shouldStop);
         }
         const latest = this.get('v2_snapshots', id);
@@ -455,6 +499,7 @@ export class WorkflowEngine {
     if (apply && !this.config.enabled) fail('WORKFLOW_DISABLED');
     if (apply) { this.attachmentsReady = false; if (!this.mirror?.hasPendingDetails) this.salesDetailsReady = false; }
     const acknowledgedEvents = apply ? this.pendingEvents() : [];
+    const statusEdits = this.pendingStatusEdits(acknowledgedEvents), failedStatusEdits = new Set();
     const acknowledgedStaffEvents=apply?this.staffEvents().filter(event=>event.state==='pending').map(event=>event.id):[];
     const interrupted = () => ({ ok: true, apply, scanned: 0, counts: {}, errors: [], plans: [], stopped: true,
       salesDetailsReady: apply && this.salesDetailsReady, needsRescan: Boolean(this.meta('mirror_rescan_needed')), nextRetryAt: this.nextRetryAt() });
@@ -475,10 +520,18 @@ export class WorkflowEngine {
     for (const record of orderedRecords) {
       if (stopped(shouldStop)) break;
       try {
-        const view = recordView(record, resolved); sourceViews.push(view); plans.push(this.preview(view));
+        let view = recordView(record, resolved), statusEdit;
+        if (statusEdits.has(view.id)) {
+          try { ({ view, statusEdit } = await this.readSourceWithStatusEdit(view.id, statusEdits.get(view.id))); }
+          catch (error) {
+            failedStatusEdits.add(view.id);
+            errors.push({ code: safeCode(error) });
+          }
+        }
+        sourceViews.push(view); plans.push(this.preview(view));
         if (!apply) continue;
         const old = this.get('v2_snapshots', view.id);
-        this.observe(view, { baseline: !old && knownLegacy.has(view.id) });
+        this.observe(view, { baseline: !old && knownLegacy.has(view.id), statusEdit });
         await this.processRecord(view.id, shouldStop);
         await this.drain(shouldStop, task => task.recordId === view.id && task.state === 'pending' && task.attempts === 0, { contactFirst: true });
       } catch (error) {
@@ -531,7 +584,8 @@ export class WorkflowEngine {
           const event = this.get(table, accepted.id);
           if (event?.state !== 'pending') continue;
           const salesNeedsFull = salesEvent(event) || event.requiresReconciliation;
-          if (salesNeedsFull && !mirrorReconciled || event.requiresOperatorReconciliation && !operatorReconciled) {
+          if (event.statusEdits?.some(edit => failedStatusEdits.has(edit.recordId)) ||
+            salesNeedsFull && !mirrorReconciled || event.requiresOperatorReconciliation && !operatorReconciled) {
             this.put(table, { ...event, reconciliationRetryAt: this.now() + 30_000 });
             continue;
           }
@@ -730,7 +784,11 @@ export class WorkflowEngine {
   taskCurrent(task, snapshot) {
     if (!snapshot || snapshot.deleted) return false;
     if (task.kind === 'owner') return Boolean(snapshot.view.owner && snapshot.view.owner === task.owner && snapshot.ownerVersion === task.ownerVersion);
-    if (task.kind === 'status') return Boolean(task.statusWritebackId && snapshot.statusVersion === task.statusVersion && operatorNoticeStatuses.has(snapshot.view.wxStatus));
+    if (task.kind === 'status') {
+      const verifiedEdit = task.statusEditRevision && task.statusEditRevision === snapshot.statusEditRevision &&
+        task.ownerVersion === snapshot.ownerVersion && task.owner === snapshot.view.owner;
+      return Boolean((task.statusWritebackId || verifiedEdit) && snapshot.statusVersion === task.statusVersion && operatorNoticeStatuses.has(snapshot.view.wxStatus));
+    }
     return Boolean(activeContact(snapshot.view) && snapshot.contactSignature && snapshot.contactSignature === task.contactSignature && snapshot.view.owner === task.owner);
   }
   validMirrorURL(result, member) {
@@ -748,7 +806,7 @@ export class WorkflowEngine {
       view = await this.readSource(task.recordId); snapshot = this.observe(view); task = this.get('v2_outbox', id);
       if (!task || !pending(task)) return;
       if (!this.taskCurrent(task, snapshot)) {
-        const reason = task.kind === 'status' && !task.statusWritebackId ? 'STATUS_ORIGIN_UNVERIFIED' : 'EVENT_SUPERSEDED';
+        const reason = task.kind === 'status' && !task.statusWritebackId && !task.statusEditRevision ? 'STATUS_ORIGIN_UNVERIFIED' : 'EVENT_SUPERSEDED';
         this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: reason });
         return;
       }

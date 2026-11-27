@@ -56,6 +56,188 @@ function targetEvent(target, id, recordId, action = 'record_edited') {
   return { id, appToken: target.appToken, tableId: target.tableId, recordIds: [recordId], actions: [{ action, recordId }] };
 }
 
+const masterEditTime = Date.UTC(2026, 10, 26, 10);
+function directStatusEdit(client, id, { actor = 'ou_offlineSalesA', revision = 41, editedAt = masterEditTime + 1000, from = '待添加', to = '未通过' } = {}) {
+  client.change(id, { wxStatus: to });
+  const record = client.records.get(id);
+  record.last_modified_by = { id: actor }; record.last_modified_time = editedAt;
+  return { recordId: id, actor, revision, editedAt, from, to };
+}
+function masterStatusEvent(engine, id, edit) {
+  return { ...targetEvent({ appToken: engine.config.appToken, tableId: engine.config.tableIds.leads }, id, edit.recordId), statusEdits: [clone(edit)] };
+}
+const statusTasks = engine => engine.all('v2_outbox').filter(task => task.kind === 'status');
+
+for (const path of ['quick', 'scan']) test(`direct master status by its current sales owner notifies exactly once through ${path}`, async t => {
+  let now = masterEditTime;
+  const id = `recLeaddirect${path}`, record = lead(`direct${path}`, { owner: 'ou_offlineSalesA' });
+  const { engine, client } = await fixture(t, { client: new Client([record]), now: () => now });
+  now += 1000;
+  const edit = directStatusEdit(client, id, { editedAt: now });
+  const proofReads = [], read = client.readRecord.bind(client);
+  client.readRecord = async (table, recordId, options) => { proofReads.push(options); return read(table, recordId); };
+  assert.equal(engine.acceptEvent(masterStatusEvent(engine, `direct-event-${path}`, edit)), true);
+  if (path === 'quick') {
+    client.listRecords = async () => { throw new Error('targeted direct status must not wait for a full list'); };
+    await engine.processPendingEvents();
+  } else await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA');
+  assert.match(client.sent[0].text, /微信状态：未通过/);
+  assert.equal(statusTasks(engine).length, 1); assert.equal(statusTasks(engine)[0].state, 'sent');
+  assert.ok(proofReads.some(options => options?.automaticFields === true));
+  assert.equal(client.writes.length, 0);
+  engine.acceptEvent(masterStatusEvent(engine, `same-revision-other-id-${path}`, edit));
+  await engine.processPendingEvents(); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 1); assert.equal(statusTasks(engine).length, 1);
+});
+
+test('a verified direct status arriving after a snapshot-only scan still notifies once and later revisions can notify again', async t => {
+  let now = masterEditTime;
+  const id = 'recLeadsnapshotFirst';
+  const { engine, client } = await fixture(t, { client: new Client([lead('snapshotFirst', { owner: 'ou_offlineSalesA' })]), now: () => now });
+  now += 1000;
+  const edit = directStatusEdit(client, id, { editedAt: now });
+  await engine.scan({ apply: true });
+  assert.equal(engine.get('v2_snapshots', id).view.wxStatus, '未通过');
+  assert.equal(client.sent.length, 0); assert.equal(statusTasks(engine).length, 0);
+  engine.acceptEvent(masterStatusEvent(engine, 'late-proof-after-snapshot', edit));
+  await engine.processPendingEvents(); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(statusTasks(engine).length, 1);
+  now += 1000;
+  const passed = directStatusEdit(client, id, { revision: 42, editedAt: now, from: '未通过', to: '通过' });
+  engine.acceptEvent(masterStatusEvent(engine, 'later-passed-proof', passed)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 1);
+  now += 1000;
+  const later = directStatusEdit(client, id, { revision: 43, editedAt: now, from: '通过', to: '未通过' });
+  engine.acceptEvent(masterStatusEvent(engine, 'later-negative-proof', later)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 2); assert.equal(statusTasks(engine).length, 2);
+  engine.acceptEvent(masterStatusEvent(engine, 'replayed-old-revision-after-later-change', edit)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 2);
+});
+
+test('direct master status stays silent for another actor, unknown owner, stale source status or stale automatic evidence', async t => {
+  for (const cause of ['other_actor', 'unknown_owner', 'source_status', 'modified_actor', 'modified_time', 'no_automatic_fields']) await t.test(cause, async t => {
+    let now = masterEditTime;
+    const id = `recLeadproof${cause}`;
+    const { engine, client } = await fixture(t, { client: new Client([lead(`proof${cause}`, { owner: 'ou_offlineSalesA' })]), now: () => now });
+    now += 1000;
+    const actor = cause === 'other_actor' ? 'ou_offlineSalesB' : cause === 'unknown_owner' ? 'ou_unknownSales' : 'ou_offlineSalesA';
+    if (cause === 'unknown_owner') {
+      client.change(id, { owner: actor });
+      const snapshot = engine.get('v2_snapshots', id); engine.put('v2_snapshots', { ...snapshot, view: { ...snapshot.view, owner: actor } });
+    }
+    const edit = directStatusEdit(client, id, { actor, editedAt: now });
+    const raw = client.records.get(id);
+    if (cause === 'source_status') client.change(id, { wxStatus: '号码错误' });
+    if (cause === 'modified_actor') raw.last_modified_by = { id: 'ou_offlineSalesB' };
+    if (cause === 'modified_time') raw.last_modified_time = now + 1;
+    if (cause === 'no_automatic_fields') { delete raw.last_modified_by; delete raw.last_modified_time; }
+    engine.acceptEvent(masterStatusEvent(engine, `untrusted-direct-${cause}`, edit));
+    await engine.processPendingEvents(); await engine.scan({ apply: true });
+    assert.equal(client.sent.length, 0); assert.equal(statusTasks(engine).length, 0);
+  });
+});
+
+test('malformed direct status proof cannot create a status task or crash normal reconciliation', async t => {
+  const variants = [
+    edit => ({ ...edit, actor: '' }), edit => ({ ...edit, revision: -1 }), edit => ({ ...edit, revision: 1.5 }),
+    edit => ({ ...edit, revision: '41' }), edit => ({ ...edit, editedAt: 'not-a-time' }),
+    edit => ({ ...edit, from: {} }), edit => ({ ...edit, to: {} }),
+    edit => ({ ...edit, recordId: 'recUnrelatedProof' }), edit => ({ ...edit, from: edit.to }),
+  ];
+  for (const [index, transform] of variants.entries()) await t.test(`invalid proof ${index + 1}`, async t => {
+    let now = masterEditTime;
+    const id = `recLeadmalformed${index}`;
+    const { engine, client } = await fixture(t, { client: new Client([lead(`malformed${index}`, { owner: 'ou_offlineSalesA' })]), now: () => now });
+    now += 1000;
+    const edit = directStatusEdit(client, id, { editedAt: now });
+    const event = masterStatusEvent(engine, `malformed-direct-${index}`, edit); event.statusEdits = [transform(edit)];
+    try { engine.acceptEvent(event); } catch (error) { assert.match(error.code || '', /^[A-Z0-9_]{1,80}$/); }
+    await engine.processPendingEvents(); await engine.scan({ apply: true });
+    assert.equal(client.sent.length, 0); assert.equal(statusTasks(engine).length, 0);
+  });
+});
+
+test('ordinary master edits without field provenance and initial negative history do not manufacture direct status notices', async t => {
+  let now = masterEditTime;
+  const initial = lead('initialDirectNegative', { owner: 'ou_offlineSalesA', wxStatus: '未通过' });
+  initial.last_modified_by = { id: 'ou_offlineSalesA' }; initial.last_modified_time = now - 1000;
+  const { engine, client } = await fixture(t, { client: new Client([initial, lead('noDirectProof', { owner: 'ou_offlineSalesA' })]), now: () => now });
+  now += 1000;
+  directStatusEdit(client, 'recLeadnoDirectProof', { editedAt: now });
+  engine.acceptEvent(targetEvent({ appToken: engine.config.appToken, tableId: engine.config.tableIds.leads }, 'ordinary-master-edit-without-proof', 'recLeadnoDirectProof'));
+  engine.acceptEvent(masterStatusEvent(engine, 'late-initial-negative-event', { recordId: initial.record_id, actor: 'ou_offlineSalesA', revision: 1, editedAt: masterEditTime - 1000, from: '待添加', to: '未通过' }));
+  await engine.processPendingEvents(); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 0); assert.equal(statusTasks(engine).length, 0);
+});
+
+for (const first of ['personal', 'master']) test(`personal writeback and direct master proof for one transition deliver once with ${first} first`, async t => {
+  let now = masterEditTime;
+  const id = `recLeadcrossOrigin${first}`;
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead(`crossOrigin${first}`, { owner: 'ou_offlineSalesA' })]), now: () => now });
+  now += 1000;
+  let edit;
+  if (first === 'personal') {
+    mirror.editSalesStatus(id, '未通过');
+    edit = directStatusEdit(client, id, { editedAt: now });
+    await engine.scan({ apply: true }); assert.equal(client.sent.length, 1);
+    engine.acceptEvent(masterStatusEvent(engine, `master-echo-after-${first}`, edit)); await engine.processPendingEvents();
+  } else {
+    edit = directStatusEdit(client, id, { editedAt: now });
+    engine.acceptEvent(masterStatusEvent(engine, `direct-before-${first}`, edit)); await engine.processPendingEvents();
+    assert.equal(client.sent.length, 1);
+    mirror.statusReceipts.set(id, { id: 'offline-overlapping-personal-receipt', owner: 'ou_offlineSalesA', from: '待添加', to: '未通过' });
+    await engine.scan({ apply: true });
+  }
+  engine.acceptEvent(masterStatusEvent(engine, `new-id-same-transition-${first}`, edit));
+  await engine.processPendingEvents(); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(statusTasks(engine).length, 1); assert.equal(statusTasks(engine)[0].state, 'sent');
+});
+
+test('verified master status revision remains deduplicated across SQLite restart while a new revision can notify', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'workflow-master-proof-'));
+  const dbPath = path.join(directory, 'workflow.sqlite'), id = 'recLeaddurableDirect';
+  let now = masterEditTime, resumed;
+  const { engine, client } = await fixture(t, { dbPath, now: () => now, client: new Client([lead('durableDirect', { owner: 'ou_offlineSalesA' })]) });
+  t.after(async () => {
+    await resumed?.close(); await engine.close();
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
+    rmSync(directory, { recursive: true, force: true });
+  });
+  now += 1000;
+  const edit = directStatusEdit(client, id, { editedAt: now });
+  engine.acceptEvent(masterStatusEvent(engine, 'first-persisted-master-proof', edit)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 1);
+  await engine.close();
+  resumed = new WorkflowEngine({ config: configuration(), client, dbPath, now: () => now }); resumed.mirror = new Mirror(resumed);
+  resumed.acceptEvent(masterStatusEvent(resumed, 'other-event-id-after-master-restart', edit));
+  await resumed.processPendingEvents(); await resumed.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(statusTasks(resumed).length, 1);
+  now += 1000;
+  const later = directStatusEdit(client, id, { revision: 42, editedAt: now, from: '未通过', to: '号码错误' });
+  resumed.acceptEvent(masterStatusEvent(resumed, 'new-revision-after-master-restart', later)); await resumed.processPendingEvents();
+  assert.equal(client.sent.length, 2); assert.equal(statusTasks(resumed).length, 2);
+});
+
+test('a later genuine passed-to-failed master revision is not swallowed by an older personal failure notice', async t => {
+  let now = masterEditTime;
+  const id = 'recLeadnewRevisionAfterPersonal';
+  const { engine, client, mirror } = await fixture(t, { client: new Client([lead('newRevisionAfterPersonal', { owner: 'ou_offlineSalesA' })]), now: () => now });
+  now += 1000;
+  mirror.editSalesStatus(id, '未通过'); await engine.scan({ apply: true });
+  assert.equal(client.sent.length, 1); assert.equal(engine.get('v2_snapshots', id).view.wxStatus, '未通过');
+  // Both real edits occur between reads. The final view equals the old snapshot,
+  // but the authenticated new field revision explicitly proves a new transition.
+  now += 1000; client.change(id, { wxStatus: '通过' });
+  engine.acceptEvent(targetEvent({ appToken: engine.config.appToken, tableId: engine.config.tableIds.leads }, 'passed-between-snapshots', id));
+  now += 1000;
+  const edit = directStatusEdit(client, id, { revision: 42, editedAt: now, from: '通过', to: '未通过' });
+  engine.acceptEvent(masterStatusEvent(engine, 'real-new-failed-master-revision', edit)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 2); assert.equal(statusTasks(engine).length, 2);
+  engine.acceptEvent(masterStatusEvent(engine, 'duplicate-real-new-failed-master-revision', edit)); await engine.processPendingEvents();
+  assert.equal(client.sent.length, 2);
+});
+
 test('sales feedback is durable, deduplicated, and notifies only after a verified current negative writeback', async t => {
   const folder = mkdtempSync(path.join(tmpdir(), 'workflow-child-feedback-'));
   const dbPath = path.join(folder, 'workflow.sqlite');
