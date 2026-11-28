@@ -30,14 +30,14 @@ async function fixture(t) {
   t.after(() => stream.stop());
   return { get config() { return config; }, set config(value) { config = value; }, received, stream, deliver: input => handler(input), closed: () => closed };
 }
-const edit = (to = '未通过', from = '待添加') => ({ recordId, actor, revision: 42, editedAt: 1795650000000, from, to });
+const edit = (to = '未通过', from = '待添加') => ({ recordId, actor, revision: 42, editedAt: 1795650000000, from, to, secondPrecision: true });
 
 test('exact master status edits expose only the minimal proof for the three supported outcomes', async t => {
   const f = await fixture(t);
   for (const to of ['未通过', '号码错误', '主动加未添加']) {
     await f.deliver(payload(f.config, { to }));
     assert.deepEqual(f.received.at(-1).statusEdits, [edit(to)]);
-    assert.deepEqual(Object.keys(f.received.at(-1).statusEdits[0]).sort(), ['recordId', 'actor', 'revision', 'editedAt', 'from', 'to'].sort());
+    assert.deepEqual(Object.keys(f.received.at(-1).statusEdits[0]).sort(), ['recordId', 'actor', 'revision', 'editedAt', 'from', 'to', 'secondPrecision'].sort());
   }
   assert.equal(f.stream.status().state, 'connected');
 });
@@ -55,11 +55,15 @@ test('raw merged SDK bodies and nested event envelopes preserve identical normal
   assert.equal(normalizeRecordEvent(nested).statusEdits, undefined);
 });
 
-test('serialized single text segments are supported while unknown select ID objects are ignored', async t => {
+test('serialized text and select choices are parsed without trusting a supplied select label', async t => {
   const f = await fixture(t);
   await f.deliver(payload(f.config, { rawFrom: JSON.stringify([{ type: 'text', text: '待添加' }]), rawTo: JSON.stringify([{ type: 'text', text: '号码错误' }]) }));
   assert.deepEqual(f.received.at(-1).statusEdits, [edit('号码错误')]);
-  for (const rawTo of ['未通过', '{broken', JSON.stringify({ name: '未通过' }), JSON.stringify({ id: 'optOffline123', name: '未通过' }),
+  await f.deliver(payload(f.config, { rawFrom: '["optBefore123"]', rawTo: '{"id":"optAfter123","name":"arbitrary"}' }));
+  assert.deepEqual(f.received.at(-1).statusEdits, [edit('optAfter123', 'optBefore123')]);
+  await f.deliver(payload(f.config, { rawFrom: 'null' }));
+  assert.deepEqual(f.received.at(-1).statusEdits, [edit('未通过', '')]);
+  for (const rawTo of ['未通过', '{broken', JSON.stringify({ name: '未通过' }),
     JSON.stringify(['未通过']), JSON.stringify([{ type: 'text', text: '未' }, { type: 'text', text: '通过' }]),
     JSON.stringify([{ type: 'link', text: '未通过' }]), 'null', '42', 'true']) {
     await f.deliver(payload(f.config, { rawTo }));
@@ -72,8 +76,8 @@ test('status proofs require platform editor open_id and positive safe revision a
   const changes = [
     event => { delete event.operator_id; }, event => { event.operator_id = { user_id: 'employee-number', union_id: 'union-only' }; },
     event => { event.operator_id.open_id = 'ordinary-name'; }, event => { event.operator_id.open_id = 'ou_x'; },
-    ...[undefined, 0, -1, 1.5, '42', Number.MAX_SAFE_INTEGER + 1].map(value => event => { event.revision = value; }),
-    ...[undefined, 0, -1, 1.5, '1795650000', Number.MAX_SAFE_INTEGER].map(value => event => { event.update_time = value; }),
+    ...[undefined, 0, -1, 1.5, '4e2', Number.MAX_SAFE_INTEGER + 1].map(value => event => { event.revision = value; }),
+    ...[undefined, 0, -1, 1.5, '1795650000.5', Number.MAX_SAFE_INTEGER].map(value => event => { event.update_time = value; }),
   ];
   for (const change of changes) {
     const input = payload(f.config); change(input.event);
@@ -81,6 +85,20 @@ test('status proofs require platform editor open_id and positive safe revision a
     assert.equal(f.received.at(-1).statusEdits, undefined);
     assert.deepEqual(f.received.at(-1).recordIds, [recordId]);
   }
+});
+
+test('numeric strings and millisecond edit times preserve their actual precision', async t => {
+  const f = await fixture(t), input = payload(f.config);
+  input.event.revision = '42'; input.event.update_time = '1795650000000';
+  await f.deliver(input);
+  const { secondPrecision, ...exact } = edit();
+  assert.deepEqual(f.received.at(-1).statusEdits, [exact]);
+  input.event.update_time = '1795650000';
+  await f.deliver(input);
+  assert.deepEqual(f.received.at(-1).statusEdits, [edit()]);
+  delete input.event.operator_id;
+  await f.deliver(input);
+  assert.deepEqual(f.stream.status().masterEditCounts, { STATUS_EDIT_PARSED: 2, EDITOR_MISSING: 1 });
 });
 
 test('proofs are absent for sales child, employee table and a different master table', async t => {

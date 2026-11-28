@@ -126,6 +126,7 @@ export class AttachmentAfterCore {
       rememberRole: db.prepare("UPDATE v2_attachment_schedule_state SET value=? WHERE key='last_role'"),
       history: db.prepare('SELECT * FROM v2_attachment_schedule_history'),
       counts: db.prepare('SELECT outcome,COUNT(*) AS count FROM v2_attachment_schedule_history GROUP BY outcome'),
+      last: db.prepare('SELECT issue FROM v2_attachment_schedule_history ORDER BY checked_at DESC, key LIMIT 1'),
       save: db.prepare(`INSERT INTO v2_attachment_schedule_history VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
         fingerprint=excluded.fingerprint, ready_at=excluded.ready_at, checked_at=excluded.checked_at,
         outcome=excluded.outcome, issue=excluded.issue`),
@@ -228,8 +229,10 @@ export class AttachmentAfterCore {
   }
 
   status() {
+    const issue = this.#query.last.get()?.issue;
     return { nextDueAt: this.#query.nextSlot.get().value, staged: this.#observed !== null,
-      counts: Object.fromEntries(this.#query.counts.all().map(row => [row.outcome, row.count])) };
+      counts: Object.fromEntries(this.#query.counts.all().map(row => [row.outcome, row.count])),
+      ...(issue ? { lastIssue: operatorCode(issue) } : {}) };
   }
 }
 

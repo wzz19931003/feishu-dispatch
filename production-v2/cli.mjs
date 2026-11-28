@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowClient } from './client.mjs';
-import { ROOT, KIND, ordinaryFile, acquireLock, writeSnapshot, stopRequested, safeCode, safeDetailStatus, status, requestStop } from '../production/control.mjs';
+import { ROOT, KIND, ordinaryFile, acquireLock, writeSnapshot, stopRequested, safeCode, safeDetailStatus, safeAttachmentStatus, status, requestStop } from '../production/control.mjs';
 import { validateWorkflowConfig, resolveFields } from './field-map.mjs';
 import { WorkflowEngine } from './engine.mjs';
 import { SalesMirror, boundedSalesDetailClient, SALES_DETAIL_BUDGET_MS } from './sales-mirror.mjs';
@@ -47,6 +47,8 @@ export function nextScanTime({now=Date.now(),pollSeconds=600,hasError=false,next
 function safeStatus(engine) {
   const value = engine?.status?.() || {};
   const salesDetails = safeDetailStatus(value.salesDetails);
+  const attachmentSync = safeAttachmentStatus({ state: engine?.attachmentSetupState, ready: engine?.attachmentsReady,
+    errorCode: value.attachmentError || value.attachments?.lastIssue });
   const counts = Object.fromEntries(Object.entries(value.counts || {}).filter(([key, n]) => /^[A-Za-z0-9_-]{1,80}$/.test(key) && Number.isSafeInteger(n) && n >= 0));
   if (Number.isSafeInteger(value.reviews)) counts.review_open = value.reviews;
   if (Number.isSafeInteger(value.eventsPending)) counts.events_pending = value.eventsPending;
@@ -59,9 +61,13 @@ function safeStatus(engine) {
   for (const [key, n] of Object.entries(value.attachments?.counts || {})) {
     if (/^[a-z_]{1,40}$/.test(key) && Number.isSafeInteger(n) && n >= 0) counts[`attachments_${key}`] = n;
   }
+  for (const [key, n] of Object.entries(value.masterStatusCheckCounts || {})) {
+    if (/^[A-Z_]{1,40}$/.test(key) && Number.isSafeInteger(n) && n >= 0) counts[`master_status_${key}`] = n;
+  }
   return { initialized: value.initialized === true, counts, ...(salesDetails ? { salesDetails } : {}),
     ...(value.staff?{staffHealthy:value.staff.healthy===true,staffErrors:(value.staff.errors||[]).map(error=>safeCode(typeof error==='string'?{code:error}:error))}:{}),
     ...(value.lastScan?.at ? { lastScan: { at: value.lastScan.at, scanned: value.lastScan.scanned ?? null } } : {}),
+    ...(attachmentSync ? { attachmentSync } : {}),
     ...(value.attachmentError ? { attachmentErrorCode: safeCode({ code: value.attachmentError }) } : {}),
     nextRetryAt: Number.isSafeInteger(value.nextRetryAt) ? value.nextRetryAt : null };
 }
@@ -139,6 +145,7 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
     if (enableAttachmentRuntime) {
       try {
         const bindings = readAttachmentConfig(root, config);
+        engine.attachmentSetupState = bindings ? 'disabled' : 'not_configured';
         if (bindings?.enabled) {
           const verifyLiveConfig = async () => {
             if (!engine.staff?.healthy || engine.staffFailure ||
@@ -156,9 +163,12 @@ export async function createEngine(config, { root = ROOT, client = new WorkflowC
               return staff.readCurrent(id);
             },
           });
+          engine.attachmentSetupState = 'enabled';
         }
       } catch (error) {
-        engine.attachmentError = safeCode(error);
+        engine.attachmentSetupState = 'blocked';
+        const code = safeCode(error);
+        engine.attachmentError = code.startsWith('ATTACHMENT_') ? code : 'ATTACHMENT_CONFIG_INVALID';
       }
     }
     return engine;

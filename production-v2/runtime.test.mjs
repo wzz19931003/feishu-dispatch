@@ -9,7 +9,7 @@ import { workflowConfig } from './test-fixtures.mjs';
 import { WorkflowEvents } from './events.mjs';
 import { createBackup } from './backup.mjs';
 import { restore } from './restore.mjs';
-import { requestStop, acquireLock, writeSnapshot, status, safeDetailStatus, KIND } from '../production/control.mjs';
+import { requestStop, acquireLock, writeSnapshot, status, safeDetailStatus, safeAttachmentStatus, KIND } from '../production/control.mjs';
 
 test('v2 rejects disabled or wrong-host activation before engine, network, or lock', async()=>{
   const root=mkdtempSync(path.join(tmpdir(),'shiyeji-v2-guard-'));let calls=0;
@@ -31,6 +31,24 @@ test('a mirror setup error closes an already-created engine',async()=>{
   class BrokenMirror{constructor(){throw Object.assign(new Error('setup failed'),{code:'MIRROR_TEST_FAILURE'});}}
   await assert.rejects(createEngine({dbPath:'data/workflow.sqlite'},{root:tmpdir(),client:{},Engine:FakeEngine,Mirror:BrokenMirror}),{code:'MIRROR_TEST_FAILURE'});
   assert.equal(closed,1);
+});
+test('attachment setup distinguishes missing, disabled, and blocked configuration without calling Feishu', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-v2-attachment-status-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = workflowConfig();
+  const file = path.join(root, 'config.attachments.local.json');
+  const client = { async api() { assert.fail('setup must not contact Feishu'); } };
+  class FakeEngine { constructor({ config }) { this.config = config; this.db = {}; } }
+  class FakeMirror {}
+  const open = () => createEngine(config, { root, client, Engine: FakeEngine, Mirror: FakeMirror, enableAttachmentRuntime: true });
+  assert.equal((await open()).attachmentSetupState, 'not_configured');
+  writeFileSync(file, JSON.stringify({ enabled: false }));
+  assert.equal((await open()).attachmentSetupState, 'disabled');
+  writeFileSync(file, '{malformed private fixture');
+  const blocked = await open();
+  assert.equal(blocked.attachmentSetupState, 'blocked');
+  assert.equal(blocked.attachmentError, 'ATTACHMENT_CONFIG_INVALID');
+  assert.equal(blocked.attachments, undefined);
 });
 test('personal clients and tenant-token cache are reused instead of reauthenticating per customer',async()=>{
   const config=workflowConfig();
@@ -176,19 +194,22 @@ test('interrupted core passes cannot reset the age of already validated detail w
   assert.equal(details, 1); assert(scans > 4);
 });
 
-test('detail status exposes only fixed diagnostics and excludes raw record or customer values', t => {
+test('detail and attachment status expose fixed diagnostics without raw record or customer values', t => {
   const root = mkdtempSync(path.join(tmpdir(), 'shiyeji-v2-safe-detail-status-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const lease = acquireLock(root);
   try {
     const value = { detailPending: 1, detailAttemptsTotal: 3, detailLastAttemptAt: 1_760_000_000_000,
       detailLastErrorCode: 'SALES_DETAIL_TIMEOUT', recordId: 'recPrivateFixture', customerWechat: 'private-fixture-value', detailUnexpectedSecret: 123 };
-    writeSnapshot(root, { kind: KIND, ...lease.lock, checkedAt: new Date().toISOString(), salesDetails: value });
+    writeSnapshot(root, { kind: KIND, ...lease.lock, checkedAt: new Date().toISOString(), salesDetails: value,
+      attachmentSync: { state: 'enabled', ready: true, errorCode: 'ATTACHMENT_EFFECTIVE_ACL_UNVERIFIED', fileToken: 'private-fixture-value' } });
     assert.deepEqual(status(root).salesDetails, { detailPending: 1, detailAttemptsTotal: 3,
       detailLastAttemptAt: 1_760_000_000_000, detailLastErrorCode: 'SALES_DETAIL_TIMEOUT' });
     assert.equal(JSON.stringify(status(root)).includes('private-fixture-value'), false);
     assert.equal(safeDetailStatus({ detailPending: -1, detailLastErrorCode: 'unsafe error with private details' }), undefined);
     assert.equal(safeDetailStatus({}), undefined);
+    assert.deepEqual(status(root).attachmentSync, { state: 'enabled', ready: true, errorCode: 'ATTACHMENT_EFFECTIVE_ACL_UNVERIFIED' });
+    assert.deepEqual(safeAttachmentStatus({ state: 'blocked', ready: true, errorCode: 'unsafe private fixture' }), { state: 'blocked' });
   } finally { lease.release(); }
 });
 

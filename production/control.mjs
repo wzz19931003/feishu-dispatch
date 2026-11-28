@@ -18,6 +18,13 @@ export function safeDetailStatus(value) {
   if (typeof value.detailLastErrorCode === 'string' && (value.detailLastErrorCode === '' || /^[A-Z0-9_]{1,80}$/.test(value.detailLastErrorCode))) result.detailLastErrorCode = value.detailLastErrorCode;
   return Object.keys(result).length ? result : undefined;
 }
+export function safeAttachmentStatus(value) {
+  if (!['not_configured', 'disabled', 'blocked', 'enabled'].includes(value?.state)) return undefined;
+  const result = { state: value.state };
+  if (value.state === 'enabled') result.ready = value.ready === true;
+  if (typeof value.errorCode === 'string' && /^ATTACHMENT_[A-Z0-9_]{1,69}$/.test(value.errorCode)) result.errorCode = value.errorCode;
+  return result;
+}
 export function ordinaryFile(filename, max = 1024 * 1024) {
   const stat = lstatSync(filename);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > max) throw Object.assign(new Error('文件状态异常'), { code: 'UNSAFE_FILE' });
@@ -60,8 +67,9 @@ export function status(root = ROOT, { now = Date.now, alive = processState } = {
   const staffStatus=matching&&typeof snapshot.staffHealthy==='boolean'?{staffHealthy:snapshot.staffHealthy,staffErrors:Array.isArray(snapshot.staffErrors)?snapshot.staffErrors.map(code=>safeCode({code})):[]}:{};
   const release=matching&&/^2\.\d+\.\d+$/.test(snapshot.runnerRelease||'')?{runnerRelease:snapshot.runnerRelease}:{};
   const detailStatus = matching ? safeDetailStatus(snapshot.salesDetails) : undefined;
+  const attachmentStatus = matching ? safeAttachmentStatus(snapshot.attachmentSync) : undefined;
   return { kind: KIND, processStatus, running: processStatus === 'alive' && fresh, statusFresh: fresh, heartbeatAgeSeconds: Number.isFinite(age) ? Math.max(0, Math.round(age / 1000)) : null, pid: lock?.pid || null,
-    ...staffStatus,...release,...(detailStatus ? { salesDetails: detailStatus } : {}),
+    ...staffStatus,...release,...(detailStatus ? { salesDetails: detailStatus } : {}), ...(attachmentStatus ? { attachmentSync: attachmentStatus } : {}),
     ...(matching ? { phase: snapshot.phase, connection: snapshot.connection, initialized: snapshot.initialized, counts: snapshot.counts, lastScan: snapshot.lastScan, lastErrorCode: snapshot.lastErrorCode, nextScanAt: snapshot.nextScanAt, enabled: snapshot.enabled, notificationsEnabled: snapshot.notificationsEnabled } : { phase: lock ? 'unknown' : 'stopped' }) };
 }
 export function requestStop(root = ROOT) {

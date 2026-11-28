@@ -68,6 +68,56 @@ function masterStatusEvent(engine, id, edit) {
 }
 const statusTasks = engine => engine.all('v2_outbox').filter(task => task.kind === 'status');
 
+test('a Feishu SDK status event with select IDs and a seconds timestamp generates just one reminder', async t => {
+  const { EventDispatcher } = await import('@larksuiteoapi/node-sdk');
+  const { WorkflowEvents } = await import('./events.mjs');
+  const id = 'recLeadsdkSelect', config = configuration();
+  config.fields.leads.wxStatus.types = [3];
+  const client = new Client([lead('sdkSelect', { owner: 'ou_offlineSalesA' })]);
+  const fieldId = config.fields.leads.wxStatus.fieldId;
+  Object.assign(client.schema.find(field => field.field_id === fieldId), { type: 3, property: {
+    options: [{ id: 'optOfflineBefore', name: '待添加' }, { id: 'optOfflineAfter', name: '未通过' }],
+  } });
+  let now = masterEditTime, dispatcher;
+  const { engine } = await fixture(t, { config, client, now: () => now });
+  class OfflineWS {
+    constructor(options) { this.options = options; }
+    start({ eventDispatcher }) { dispatcher = eventDispatcher; this.options.onReady(); }
+    close() {}
+  }
+  const events = new WorkflowEvents(config, { sdkLoader: async () => ({ EventDispatcher, WSClient: OfflineWS }) });
+  t.after(() => events.stop());
+  await events.start(event => engine.acceptEvent(event));
+  now += 1_504;
+  directStatusEdit(client, id, { editedAt: now });
+  client.records.get(id).last_modified_time = String(now);
+  const type = 'drive.file.bitable_record_changed_v1';
+  const input = { schema: '2.0', header: { event_type: type, event_id: 'offline-select-event' }, event: {
+    file_token: config.appToken, table_id: config.tableIds.leads, revision: '42', update_time: Math.floor(now / 1000),
+    operator_id: { open_id: 'ou_offlineSalesA' }, action_list: [{ action: 'record_edited', record_id: id,
+      before_value: [{ field_id: fieldId, field_value: '"optOfflineBefore"' }],
+      after_value: [{ field_id: fieldId, field_value: '["optOfflineAfter"]' }],
+    }],
+  } };
+  await dispatcher.invoke(input);
+  await engine.processPendingEvents();
+  assert.deepEqual(engine.status().masterStatusCheckCounts, { CONFIRMED: 1 });
+  assert.equal(client.sent.length, 1);
+  assert.equal(client.sent[0].recipientOpenId, 'ou_offlineOperatorA');
+  assert.match(client.sent[0].text, /微信状态：未通过/);
+  await dispatcher.invoke({ ...input, header: { ...input.header, event_id: 'offline-select-retry' } });
+  await engine.processPendingEvents();
+  assert.equal(client.sent.length, 1);
+  const unknown = clone(input);
+  unknown.header.event_id = 'offline-unknown-option';
+  unknown.event.revision = 43;
+  unknown.event.action_list[0].after_value[0].field_value = '{"id":"optOfflineMissing","name":"未通过"}';
+  await dispatcher.invoke(unknown);
+  await engine.processPendingEvents();
+  assert.equal(engine.status().masterStatusCheckCounts.SELECT_OPTION_UNKNOWN, 1);
+  assert.equal(client.sent.length, 1);
+});
+
 for (const path of ['quick', 'scan']) test(`direct master status by its current sales owner notifies exactly once through ${path}`, async t => {
   let now = masterEditTime;
   const id = `recLeaddirect${path}`, record = lead(`direct${path}`, { owner: 'ou_offlineSalesA' });
@@ -169,6 +219,19 @@ test('ordinary master edits without field provenance and initial negative histor
   engine.acceptEvent(masterStatusEvent(engine, 'late-initial-negative-event', { recordId: initial.record_id, actor: 'ou_offlineSalesA', revision: 1, editedAt: masterEditTime - 1000, from: '待添加', to: '未通过' }));
   await engine.processPendingEvents(); await engine.scan({ apply: true });
   assert.equal(client.sent.length, 0); assert.equal(statusTasks(engine).length, 0);
+});
+
+test('a newly received historical edit cannot use an earlier installed version’s activation date', async t => {
+  let now = masterEditTime;
+  const id = 'recLeadHistoricalProof';
+  const { engine, client } = await fixture(t, { client: new Client([lead('HistoricalProof', { owner: 'ou_offlineSalesA' })]), now: () => now });
+  engine.setMeta('master_status_edit_since', now - 60_000);
+  const edit = directStatusEdit(client, id, { editedAt: now - 10_000 });
+  engine.acceptEvent(masterStatusEvent(engine, 'old-proof-receipt-after-upgrade', edit));
+  engine.put('v2_inbox', { id: 'old-proof-already-in-inbox', state: 'pending', recordIds: [id], statusEdits: [edit] });
+  await engine.processPendingEvents();
+  assert.equal(client.sent.length, 0);
+  assert.equal(statusTasks(engine).length, 0);
 });
 
 for (const first of ['personal', 'master']) test(`personal writeback and direct master proof for one transition deliver once with ${first} first`, async t => {
@@ -378,6 +441,50 @@ test('seven master-event records notify before any full-table or mirror scan and
   assert.equal(resumed.acceptEvent(event), false);
   await resumed.processPendingEvents(); await resumed.scan({ apply: true });
   assert.equal(client.sent.length, 7);
+});
+
+test('one slow operator copy cannot hold the next sales notification', { timeout: 3000 }, async t => {
+  let now = masterEditTime;
+  const { engine, client, mirror } = await fixture(t, { now: () => now });
+  const records = [lead('slowOperator'), lead('nextSale')];
+  for (const record of records) client.add(record);
+  const gate = Promise.withResolvers();
+  const operator = { openId: 'ou_offlineOperatorA' }, copied = [];
+  engine.staff = { async refresh() { return { ok: true }; }, async verifyCandidate() { return true; }, operatorCandidates: () => [operator] };
+  engine.operatorMirror = {
+    async syncRecord(view) {
+      copied.push(view.id);
+      if (copied.length === 1) await gate.promise;
+      return { synced: true };
+    },
+  };
+  const ensure = mirror.ensure.bind(mirror);
+  mirror.ensure = async view => { now += 200; return ensure(view); };
+  const notified = Promise.withResolvers(), send = client.sendNotification.bind(client);
+  client.sendNotification = async draft => {
+    const result = await send(draft);
+    if (client.sent.length === 2) notified.resolve();
+    return result;
+  };
+  engine.acceptEvent({ id: 'two-sales-one-slow-operator', appToken: engine.config.appToken,
+    tableId: engine.config.tableIds.leads, recordIds: records.map(record => record.record_id) });
+  const processing = engine.processPendingEvents();
+  let timer;
+  try {
+    await Promise.race([notified.promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('the first operator copy blocked the next sales notification')), 1000);
+    })]);
+    assert.deepEqual(copied, [records[0].record_id]);
+    for (const task of engine.all('v2_outbox')) {
+      assert.equal(task.state, 'sent');
+      assert.equal(task.mirrorConfirmedAt - task.validationStartedAt, 200);
+      assert.equal(task.firstAttemptAt, task.mirrorConfirmedAt);
+    }
+  } finally { clearTimeout(timer); gate.resolve(); await processing; }
+  assert.equal((await processing).processed, 2);
+  assert.deepEqual(copied, records.map(record => record.record_id));
+  await engine.processPendingEvents();
+  assert.equal(client.sent.length, 2);
 });
 
 test('targeted event batches stop after ten records and continue durable progress', async t => {
@@ -663,11 +770,22 @@ test('attachments stage only after a complete applied scan with a healthy roster
   assert.equal(staged[0].records[0].record_id, 'recLeadattachment');
   assert.equal(ticks, 0);
   assert.equal((await engine.syncDeferredAttachments()).status, 'updated');
+  engine.mirror.sync = async () => { throw Object.assign(new Error('fixture mirror failure'), { code: 'MIRROR_FIXTURE_FAILURE' }); };
+  const unrelatedFailure = await engine.scan({ apply: true });
+  assert.equal(unrelatedFailure.ok, false);
+  assert.equal(unrelatedFailure.errors.some(error => error.code === 'MIRROR_FIXTURE_FAILURE'), true);
+  assert.equal(engine.attachmentDueAt(), 0);
+  assert.equal((await engine.syncDeferredAttachments()).status, 'updated');
   healthy = false;
   await engine.scan({ apply: true });
-  assert.equal(staged.length, 1);
+  assert.equal(staged.length, 2);
   assert.equal((await engine.syncDeferredAttachments()).status, 'skipped');
-  assert.equal(ticks, 1);
+  healthy = true;
+  client.records.get('recLeadattachment').fields.负责人 = [{ id: 'invalid' }];
+  await engine.scan({ apply: true });
+  assert.equal(staged.length, 2);
+  assert.equal((await engine.syncDeferredAttachments()).status, 'skipped');
+  assert.equal(ticks, 2);
 });
 
 test('initial source history is quiet, including non-passed statuses and customer-active-add', async t => {

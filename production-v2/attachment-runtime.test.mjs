@@ -122,7 +122,7 @@ test('shortens attachment work cooperatively when the budget expires', async t =
     throw Object.assign(new Error('synthetic operation budget'), { code: 'ATTACHMENT_STOP_REQUESTED' });
   };
   assert.deepEqual(await plan.afterCore(scanned([hint(salesTwo, photo)])), { status: 'pending', code: 'ATTACHMENT_STOP_REQUESTED' });
-  assert.deepEqual(plan.status(), { nextDueAt: 61_000, staged: true, counts: { pending: 1 } });
+  assert.deepEqual(plan.status(), { nextDueAt: 61_000, staged: true, counts: { pending: 1 }, lastIssue: 'ATTACHMENT_STOP_REQUESTED' });
 });
 
 test('staging keeps only the scan-time attachment hints and supports a preempting core event', async t => {

@@ -128,11 +128,10 @@ export class SalesMirror {
   async exclusive(callback) { if (this.busy) fail('MIRROR_BUSY'); this.busy = true; try { return await callback(); } finally { this.busy = false; } }
   checkWrite(shouldStop) { if (this.config.enabled !== true || this.config.mirrors?.enabled !== true) fail('MIRROR_WRITES_DISABLED'); if (stopped(shouldStop)) fail('MIRROR_STOP_REQUESTED'); }
   async source(id) {
-    const schemaBefore = await this.resolveSource();
+    // The injected source reader already verifies field identities before and after its read.
     let view;
     try { view = await this.readSource(id); } catch (error) { if (absent(error)) return null; throw error; }
     if (view == null) return null;
-    if (fingerprint(schemaBefore) !== fingerprint(await this.resolveSource())) fail('MIRROR_SOURCE_SCHEMA_CHANGED_DURING_READ');
     if (view.id !== id || typeof view.owner !== 'string') fail('MIRROR_SOURCE_INVALID');
     return view;
   }

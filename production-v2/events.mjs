@@ -5,43 +5,69 @@ const quiet = { debug() {}, info() {}, warn() {}, error() {}, trace() {}, log() 
 const failure = code => Object.assign(new Error(code), { code });
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const statusTargets = new Set(['未通过', '号码错误', '主动加未添加']);
+export const isStatusOptionId = value => typeof value === 'string' && /^opt[A-Za-z0-9_-]{3,100}$/.test(value);
+
+export function eventInteger(value) {
+  if (typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value)) value = Number(value);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
 
 function statusValue(raw) {
   if (typeof raw !== 'string' || raw.length > 4096) return null;
   let value;
   try { value = JSON.parse(raw); } catch { return null; }
-  // Event field_value is serialized JSON, rather than an editable display-name claim.
+  if (value === null || Array.isArray(value) && value.length === 0) return '';
+  // Resolve option identities against the live status field before using them.
+  if (Array.isArray(value) && value.length === 1 && isStatusOptionId(value[0])) return value[0];
+  if (object(value) && isStatusOptionId(value.id)) return value.id;
   if (Array.isArray(value) && value.length === 1 && object(value[0]) && value[0].type === 'text') value = value[0].text;
   return typeof value === 'string' && value.length <= 200 && !/[\r\n\0]/.test(value) ? value.trim() : null;
 }
 
-function masterStatusEdits(input, normalized, config) {
+function masterStatusEdits(input, normalized, config, report) {
   if (normalized.appToken !== config.appToken || normalized.tableId !== config.tableIds?.leads) return [];
   const event = input?.event ?? input;
-  if (!object(event) || !Array.isArray(event.action_list) || event.action_list.length > 1000) return [];
+  if (!object(event) || !Array.isArray(event.action_list) || event.action_list.length > 1000) {
+    report('ACTION_LIST_INVALID');
+    return [];
+  }
+  if (!event.action_list.some(action => action?.action === 'record_edited')) return [];
   const fields = config.fields?.leads;
   const fieldIds = ['wxStatus', 'owner', 'operator'].map(key => fields?.[key]?.fieldId);
-  if (fieldIds.some(id => typeof id !== 'string' || !/^fld[A-Za-z0-9]{5,}$/.test(id)) || new Set(fieldIds).size !== 3) return [];
+  if (fieldIds.some(id => typeof id !== 'string' || !/^fld[A-Za-z0-9]{5,}$/.test(id)) || new Set(fieldIds).size !== 3) {
+    report('FIELD_BINDING_INVALID');
+    return [];
+  }
   const [statusId, ownerId, operatorId] = fieldIds;
-  const actor = event.operator_id?.open_id, revision = event.revision;
-  if (typeof actor !== 'string' || !/^ou_[A-Za-z0-9_-]{5,100}$/.test(actor) || !Number.isSafeInteger(revision) || revision <= 0
-    || !Number.isSafeInteger(event.update_time) || event.update_time <= 0) return [];
-  const editedAt = event.update_time * 1000;
-  if (!Number.isSafeInteger(editedAt)) return [];
+  const actor = event.operator_id?.open_id, revision = eventInteger(event.revision);
+  const updateTime = eventInteger(event.update_time);
+  if (typeof actor !== 'string' || !/^ou_[A-Za-z0-9_-]{5,100}$/.test(actor)) { report('EDITOR_MISSING'); return []; }
+  if (revision === null) { report('REVISION_MISSING'); return []; }
+  // Feishu documents seconds for the event and milliseconds for the REST timestamp.
+  const secondPrecision = updateTime >= 1_000_000_000 && updateTime < 10_000_000_000;
+  const editedAt = secondPrecision ? updateTime * 1000 : updateTime;
+  if (editedAt === null || editedAt < 1_000_000_000_000 || editedAt >= 10_000_000_000_000) { report('EDIT_TIME_INVALID'); return []; }
   const counts = new Map();
   for (const action of event.action_list) if (typeof action?.record_id === 'string') counts.set(action.record_id, (counts.get(action.record_id) || 0) + 1);
   const edits = [];
   for (const action of event.action_list) {
     const id = action?.record_id, before = action?.before_value, after = action?.after_value;
-    if (action?.action !== 'record_edited' || typeof id !== 'string' || !/^rec[A-Za-z0-9]{5,100}$/.test(id) || counts.get(id) !== 1
+    if (action?.action !== 'record_edited') continue;
+    if (typeof id !== 'string' || !/^rec[A-Za-z0-9]{5,100}$/.test(id) || counts.get(id) !== 1
       || !Array.isArray(before) || !Array.isArray(after) || before.length > 1000 || after.length > 1000
-      || !before.every(object) || !after.every(object)) continue;
-    if ([...before, ...after].some(field => field.field_id === ownerId || field.field_id === operatorId)) continue;
+      || !before.every(object) || !after.every(object)) { report('FIELD_DIFF_INVALID'); continue; }
     const oldFields = before.filter(field => field.field_id === statusId), newFields = after.filter(field => field.field_id === statusId);
-    if (oldFields.length !== 1 || newFields.length !== 1) continue;
+    if (!oldFields.length && !newFields.length) { report('STATUS_FIELD_ABSENT'); continue; }
+    if (oldFields.length !== 1 || newFields.length !== 1) { report('STATUS_DIFF_INCOMPLETE'); continue; }
+    if ([...before, ...after].some(field => field.field_id === ownerId || field.field_id === operatorId)) {
+      report('IDENTITY_FIELD_IN_DIFF');
+      continue;
+    }
     const from = statusValue(oldFields[0].field_value), to = statusValue(newFields[0].field_value);
-    if (from === null || to === null || from === to || !statusTargets.has(to)) continue;
-    edits.push({ recordId: id, actor, revision, editedAt, from, to });
+    if (from === null || to === null) { report('STATUS_VALUE_UNRECOGNIZED'); continue; }
+    if (from === to || !statusTargets.has(to) && !isStatusOptionId(to)) continue;
+    report('STATUS_EDIT_PARSED');
+    edits.push({ recordId: id, actor, revision, editedAt, from, to, ...(secondPrecision ? { secondPrecision: true } : {}) });
   }
   return edits;
 }
@@ -52,6 +78,7 @@ export class WorkflowEvents {
     this.config = config; this.sdkLoader = sdkLoader; this.timeoutMs = timeoutMs;
     this.currentConfig = currentConfig;
     this.session = null; this.stopping = null; this.last = 'idle';
+    this.masterEditCounts = {};
   }
   allows(event) {
     const config = this.currentConfig();
@@ -61,7 +88,7 @@ export class WorkflowEvents {
       config.members.some(member => member.target && matches(member.target.appToken, member.target.tableId)) ||
       Boolean(staff?.enabled && matches(staff.appToken, staff.tableId));
   }
-  status() { return { state: this.session?.state || this.last }; }
+  status() { return { state: this.session?.state || this.last, masterEditCounts: { ...this.masterEditCounts } }; }
   async start(onEvent) {
     if (this.session || this.stopping || typeof onEvent !== 'function') throw failure('EVENT_SESSION_INVALID');
     const session = { active: true, state: 'connecting', pending: new Set(), client: null, finish: null };
@@ -84,7 +111,9 @@ export class WorkflowEvents {
         if (!session.active) return;
         const event = normalizeRecordEvent(data);
         if (!this.allows(event)) return;
-        const statusEdits = masterStatusEdits(data, event, this.currentConfig());
+        const statusEdits = masterStatusEdits(data, event, this.currentConfig(), code => {
+          this.masterEditCounts[code] = (this.masterEditCounts[code] || 0) + 1;
+        });
         if (statusEdits.length) event.statusEdits = statusEdits;
         const pending = Promise.resolve().then(() => onEvent(event));
         session.pending.add(pending);

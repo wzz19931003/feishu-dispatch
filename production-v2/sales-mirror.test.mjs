@@ -77,8 +77,11 @@ function fixture({ feedbackFields = ['wxStatus'], filename = ':memory:', detailC
   const hooks = {};
   const resolveSource = () => resolveFields(source, { appToken: sourceToken, tableId: source.table, fields: config.fields.leads });
   const readSource = async id => {
+    const before = await resolveSource();
     sourceReadCount++; await hooks.beforeSource?.(id, sourceReadCount);
-    const record = await source.readRecord(source.table, id); return recordView(record, await resolveSource());
+    const record = await source.readRecord(source.table, id);
+    if (JSON.stringify(before) !== JSON.stringify(await resolveSource())) throw Object.assign(new Error('offline schema changed during source read'), { code: 'MIRROR_SOURCE_SCHEMA_CHANGED_DURING_READ' });
+    return recordView(record, before);
   };
   const db = new DatabaseSync(filename), clients = new Map([source, salesA, salesB].map(client => [client.base, client]));
   const construct = () => new SalesMirror({ config, db, sourceClient: source, clientFactory: token => { assert.ok(clients.has(token)); return clients.get(token); }, readSource, resolveSource, detailBudgetMs, now,
@@ -104,6 +107,7 @@ test('ensure re-reads source ownership, copies minimum fields and returns only t
     assert.equal(record.fields.Wechat, 'fixture-wx'); assert.equal(record.fields['Sales name'], 'Fixture A');
     assert.equal(record.fields.Owner, undefined); assert.equal(record.fields.Operator, undefined); assert.equal(record.fields.FinanceSecret, undefined);
     assert.equal(f.salesB.records.size, 0);
+    assert.equal(f.source.metrics.schema, f.source.metrics.read * 2);
     await f.mirror.ensure({ id: 'recSource1' }); await f.mirror.sync(); assert.equal(createCount(f), 1);
   } finally { f.close(); }
 });

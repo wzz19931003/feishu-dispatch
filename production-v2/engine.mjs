@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { WorkflowClient } from './client.mjs';
+import { eventInteger, isStatusOptionId } from './events.mjs';
 import { EXTRA_SOURCE_FIELDS, validateWorkflowConfig, resolveFields, recordView, encodePatch, chooseMember } from './field-map.mjs';
 
 export class WorkflowError extends Error {
@@ -26,6 +27,13 @@ const MIRROR_MANUAL = new Set(['MIRROR_CREATE_REVIEW_REQUIRED', 'MIRROR_REVOKE_R
 const salesEventKey = (event, id) => digest([event.appToken, event.tableId, id]);
 const salesEvent = event => event.scope === 'sales';
 const eventTable = event => salesEvent(event) ? 'v2_sales_inbox' : 'v2_inbox';
+
+function statusName(value, field) {
+  if (!isStatusOptionId(value)) return value;
+  if (field?.type !== 3 || !Array.isArray(field.property?.options)) return null;
+  const options = field.property.options.filter(option => option?.id === value);
+  return options.length === 1 && typeof options[0].name === 'string' ? options[0].name.trim() : null;
+}
 
 async function listAll(client, tableId, shouldStop) {
   const rows = [], ids = new Set(), tokens = new Set(); let token;
@@ -51,6 +59,7 @@ export class WorkflowEngine {
     this.config = validateWorkflowConfig(config); this.client = client || new WorkflowClient(this.config);
     this.memberProvider = memberProvider; this.mirror = mirror || null; this.now = now; this.inFlight = null; this.closed = false;
     this.salesDetailsReady = false;
+    this.masterStatusCheckCounts = {};
     this.startedAt = this.now();
     this.configSignature = stableConfig(this.config);
     const filename = dbPath || this.config.dbPath;
@@ -82,6 +91,7 @@ export class WorkflowEngine {
     this.transaction(() => {
       this.setMeta('binding', binding);
       if (Object.keys(additions).length) this.setMeta('source_extension_pins', { ...pins, ...additions });
+      if (this.meta('master_edit_validation_started_at') === null) this.setMeta('master_edit_validation_started_at', this.startedAt);
     });
   }
   hasSalesWechat() { return Boolean(this.config.staffManagement?.fields?.salesWechat); }
@@ -125,12 +135,23 @@ export class WorkflowEngine {
       const record = await this.client.readRecord(this.config.tableIds.leads, id, statusEdit ? { automaticFields: true } : undefined);
       if (digest(resolved) !== digest(await this.resolveSource())) continue;
       const view = recordView(record, resolved);
+      if (!statusEdit) return { view };
+      const from = statusName(statusEdit.from, resolved.wxStatus), to = statusName(statusEdit.to, resolved.wxStatus);
+      const modifiedAt = eventInteger(record.last_modified_time);
+      const comparableTime = statusEdit.secondPrecision && modifiedAt !== null
+        ? Math.floor(modifiedAt / 1000) * 1000 : modifiedAt;
+      const editor = record.last_modified_by?.id ?? record.last_modified_by?.open_id;
       // Verify that this field edit is still the record's current edit by its assigned sales member.
       // Record snapshots alone cannot establish who changed the field.
-      const confirmed = statusEdit && view.id === id && view.owner === statusEdit.actor && view.wxStatus === statusEdit.to &&
-        this.config.members.some(member => member.openId === view.owner) && record.last_modified_time === statusEdit.editedAt &&
-        (record.last_modified_by?.id ?? record.last_modified_by?.open_id) === statusEdit.actor;
-      return { view, statusEdit: confirmed ? statusEdit : undefined };
+      let outcome = 'CONFIRMED';
+      if (from === null || to === null) outcome = 'SELECT_OPTION_UNKNOWN';
+      else if (from === to || !operatorNoticeStatuses.has(to)) outcome = 'STATUS_NOT_ELIGIBLE';
+      else if (view.id !== id || view.wxStatus !== to) outcome = 'CURRENT_STATUS_MISMATCH';
+      else if (view.owner !== statusEdit.actor || !this.config.members.some(member => member.openId === view.owner)) outcome = 'EDITOR_NOT_OWNER';
+      else if (editor !== statusEdit.actor) outcome = 'LAST_EDITOR_MISMATCH';
+      else if (comparableTime !== statusEdit.editedAt) outcome = 'LAST_EDIT_TIME_MISMATCH';
+      this.masterStatusCheckCounts[outcome] = (this.masterStatusCheckCounts[outcome] || 0) + 1;
+      return { view, statusEdit: outcome === 'CONFIRMED' ? { ...statusEdit, from, to } : undefined };
     }
     fail('SOURCE_SCHEMA_CHANGED_DURING_READ');
   }
@@ -163,14 +184,17 @@ export class WorkflowEngine {
     const id = master ? event.id : salesEventKey(event, event.id);
     const table = master ? 'v2_inbox' : 'v2_sales_inbox';
     if (this.get(table, id)) return false;
-    const statusEditSince = this.meta('master_status_edit_since') ?? this.startedAt;
+    // Already persisted work keeps its original proof. Newly received old events
+    // must not turn into retrospective reminders after a process restart/upgrade.
+    const statusEditSince = this.startedAt;
     const statusEdits = master && Array.isArray(event.statusEdits) ? event.statusEdits.filter(edit =>
       edit && recordIds.includes(edit.recordId) && /^ou_[A-Za-z0-9_-]{3,128}$/.test(edit.actor) &&
       Number.isSafeInteger(edit.revision) && edit.revision > 0 && Number.isSafeInteger(edit.editedAt) && edit.editedAt >= statusEditSince &&
-      typeof edit.from === 'string' && edit.from.length <= 80 && edit.from !== edit.to && operatorNoticeStatuses.has(edit.to))
-      .map(({ recordId, actor, revision, editedAt, from, to }) => ({ recordId, actor, revision, editedAt, from, to })) : [];
+      typeof edit.from === 'string' && edit.from.length <= 80 && edit.from !== edit.to &&
+      (operatorNoticeStatuses.has(edit.to) || isStatusOptionId(edit.to)))
+      .map(({ recordId, actor, revision, editedAt, from, to, secondPrecision }) => ({ recordId, actor, revision, editedAt, from, to,
+        ...(secondPrecision === true && editedAt % 1000 === 0 ? { secondPrecision: true } : {}) })) : [];
     this.transaction(() => {
-      if (master && this.meta('master_status_edit_since') == null) this.setMeta('master_status_edit_since', statusEditSince);
       this.put(table, { id, recordIds, state: 'pending', receivedAt: this.stamp(),
         ...(statusEdits.length ? { statusEdits } : {}),
         ...(master ? {} : { scope: 'sales', appToken: event.appToken, tableId: event.tableId }) });
@@ -179,9 +203,10 @@ export class WorkflowEngine {
   }
   pendingStatusEdits(events) {
     const edits = new Map();
+    const since = this.meta('master_edit_validation_started_at');
     for (const event of events) {
       for (const edit of event.statusEdits ?? []) {
-        if (event.processedRecordIds?.includes(edit.recordId)) continue;
+        if (edit.editedAt < since || event.processedRecordIds?.includes(edit.recordId)) continue;
         if (edit.revision > (edits.get(edit.recordId)?.revision ?? 0)) edits.set(edit.recordId, edit);
       }
     }
@@ -359,6 +384,8 @@ export class WorkflowEngine {
     await this.refreshMembers();
     const knownLegacy = new Set(this.meta('legacy_known_ids') || []);
     const results = new Map(), errors = [...(staff.errors || [])];
+    const operatorResults = new Map();
+    let operatorWork = Promise.resolve();
     for (const id of recordIds) {
       if (stopped(shouldStop)) break;
       try {
@@ -369,18 +396,22 @@ export class WorkflowEngine {
           this.observe(view, { baseline: !this.get('v2_snapshots', id) && knownLegacy.has(id), statusEdit });
           await this.processRecord(id, shouldStop);
         }
-        const latest = this.get('v2_snapshots', id);
-        const [needsOperator, notice] = await Promise.allSettled([
-          latest ? this.syncOperatorRecord(latest, staff, shouldStop, errors) : Boolean(this.operatorMirror),
-          view ? this.drain(shouldStop, task => task.recordId === id && task.state === 'pending' && task.attempts === 0, { contactFirst: true }) : undefined,
-        ]);
-        if (notice.status === 'rejected') throw notice.reason;
-        if (needsOperator.status === 'rejected') throw needsOperator.reason;
+        // The operator mirror supports one operation at a time. Keep that lane serial,
+        // but let the next sales notification proceed while an operator copy is in progress.
+        operatorWork = operatorWork.then(async () => {
+          const latest = this.get('v2_snapshots', id);
+          return latest ? this.syncOperatorRecord(latest, staff, shouldStop, errors) : Boolean(this.operatorMirror);
+        }).then(needsOperator => operatorResults.set(id, { needsOperator }), error => {
+          errors.push({ code: safeCode(error) });
+          operatorResults.set(id, { failed: true });
+        });
+        if (view) await this.drain(shouldStop, task => task.recordId === id && task.state === 'pending' && task.attempts === 0, { contactFirst: true });
         if (stopped(shouldStop)) break;
-        results.set(id, { needsSales: !view?.owner || !this.config.members.some(member => member.openId === view.owner && member.target),
-          needsOperator: needsOperator.value });
+        results.set(id, { needsSales: !view?.owner || !this.config.members.some(member => member.openId === view.owner && member.target) });
       } catch (error) { results.set(id, { failed: true }); errors.push({ code: safeCode(error) }); }
     }
+    await operatorWork;
+    for (const [id, operatorResult] of operatorResults) if (results.has(id)) Object.assign(results.get(id), operatorResult);
     this.settleRecordEvents(masterEvents, results);
     const salesResults = new Map();
     for (const [key, { event, id }] of salesRecords) {
@@ -593,7 +624,9 @@ export class WorkflowEngine {
         }
         if(staffResult.healthy!==false)for(const id of acknowledgedStaffEvents){const row=this.db.prepare('SELECT data FROM v2_staff_runtime_events WHERE id=?').get(id);if(row){const event=JSON.parse(row.data);if(event.state==='pending')this.db.prepare('UPDATE v2_staff_runtime_events SET data=? WHERE id=?').run(JSON.stringify({...event,state:'done',processedAt:this.stamp()}),id);}}
       }
-      if (this.attachments && staffResult.healthy === true && !errors.length && sourceViews.length === records.length && !stopped(shouldStop)) {
+      // Attachment writes recheck the active record, owner and target ACL. An unrelated
+      // record's notification or mirror failure must not disable every attachment.
+      if (this.attachments && staffResult.healthy === true && sourceViews.length === records.length && !stopped(shouldStop)) {
         try {
           this.attachmentsReady = this.attachments.stageCore({ apply, healthy: true, complete: true, records }) === true;
           this.attachmentError = '';
@@ -801,7 +834,8 @@ export class WorkflowEngine {
   async deliver(id, shouldStop) {
     let task = this.get('v2_outbox', id);
     if (!task || !pending(task) || stopped(shouldStop)) return;
-    let snapshot, view, member;
+    const validationStartedAt = this.now();
+    let snapshot, view, member, mirrorConfirmedAt;
     try {
       view = await this.readSource(task.recordId); snapshot = this.observe(view); task = this.get('v2_outbox', id);
       if (!task || !pending(task)) return;
@@ -832,6 +866,7 @@ export class WorkflowEngine {
         await this.refreshMembers();
         member = this.config.members.find(member => member.openId === view.owner);
         if (!member?.target || !this.validMirrorURL(target, member)) fail('MEMBER_BINDING_CHANGED');
+        mirrorConfirmedAt = this.now();
       }
       const recipient = task.kind === 'owner' ? view.owner : view.operator;
       if (!recipient) { this.wait(task, 'waiting_operator', 'OPERATOR_REQUIRED'); return; }
@@ -846,7 +881,8 @@ export class WorkflowEngine {
       if (task.delivery && task.delivery.recipientOpenId !== draft.recipientOpenId) { this.put('v2_outbox', { ...task, state: 'cancelled', errorCode: 'RECIPIENT_CHANGED' }); return; }
       const firstAttemptAt = task.firstAttemptAt || this.now();
       if (this.now() - firstAttemptAt >= 55 * 60_000) { this.put('v2_outbox', { ...task, state: 'review', errorCode: 'MESSAGE_RETRY_WINDOW_EXCEEDED' }); this.review(task.recordId, 'MESSAGE_RETRY_WINDOW_EXCEEDED', task.id); return; }
-      task = { ...task, state: 'sending', attempts: task.attempts + 1, firstAttemptAt, delivery: task.delivery || draft };
+      const firstValidation = task.attempts === 0 ? { validationStartedAt, ...(mirrorConfirmedAt === undefined ? {} : { mirrorConfirmedAt }) } : {};
+      task = { ...task, ...firstValidation, state: 'sending', attempts: task.attempts + 1, firstAttemptAt, delivery: task.delivery || draft };
       this.put('v2_outbox', task);
       try {
         const sent = await this.client.sendNotification({ ...task.delivery, idempotencyKey: task.id });
@@ -898,7 +934,8 @@ export class WorkflowEngine {
       staffEventsPending:this.staffEvents().filter(event=>event.state==='pending').length,
       nextRetryAt: this.nextRetryAt(), lastScan: this.meta('last_scan'), mirror: { ...this.meta('mirror_status'), ...this.meta('sales_detail_status') },
       salesDetailsReady: this.salesDetailsReady && !this.staffFailure, salesDetails: this.meta('sales_detail_status') || {},
-      operatorMirror: this.meta('operator_mirror_status') || {}, ...(this.staff?{staff:this.staff.status()}:{} ),
+      operatorMirror: this.meta('operator_mirror_status') || {}, masterStatusCheckCounts: { ...this.masterStatusCheckCounts },
+      ...(this.staff?{staff:this.staff.status()}:{} ),
       ...(this.attachments ? { attachments: this.attachments.status() } : {}),
       ...(this.attachmentError ? { attachmentError: this.attachmentError } : {}) };
   }
